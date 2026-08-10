@@ -637,7 +637,19 @@ def plan_id(plan_obj):
         json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
-def render_prompt(item, pack, tier, template=None):
+# What a worker must hand back. A caller's context grows by whatever its workers
+# RETURN, so an unbounded prose report is the single biggest source of bloat in a
+# long run - and the part nobody notices, because each individual report looks
+# reasonable. A fixed, small schema caps it by construction.
+RETURN_CONTRACT = (
+    'When finished, print ONE line of JSON and nothing after it:\n'
+    '{"item":"<name>","status":"ok"|"failed","files_changed":["path",...],'
+    '"receipt":"<how you proved it works>","notes":"<=200 chars"}\n'
+    'Keep it short. Anything outside that line is recorded but not read back.'
+)
+
+
+def render_prompt(item, pack, tier, template=None, contract=RETURN_CONTRACT):
     """The self-contained prompt for ONE item. A spawned process is a FRESH
     session - it inherits no conversation - so everything needed must be in
     here. This is what context_packs buys: the agent is TOLD what to edit and
@@ -646,7 +658,8 @@ def render_prompt(item, pack, tier, template=None):
     read = ", ".join(pack.get("read", []))
     if template:
         for key, val in (("{name}", item["name"]), ("{task}", item.get("task", "")),
-                         ("{edit}", edit), ("{read}", read), ("{tier}", tier)):
+                         ("{edit}", edit), ("{read}", read), ("{tier}", tier),
+                         ("{contract}", contract or "")):
             template = template.replace(key, val)
         return template
     lines = ["Task: " + (item.get("task") or item["name"])]
@@ -657,7 +670,26 @@ def render_prompt(item, pack, tier, template=None):
     lines.append("Other agents are working in this tree RIGHT NOW on disjoint "
                  "files. Touching anything outside the edit list will collide "
                  "with them.")
+    if contract:
+        lines.append("")
+        lines.append(contract)
     return "\n".join(lines)
+
+
+def parse_return(text):
+    """The worker's structured line, if it produced one: the LAST line that parses
+    as a JSON object. Everything else it printed stays in the log file and out of
+    the caller's context."""
+    for line in reversed((text or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
 
 
 def build_argv(exec_template, prompt, item):
@@ -670,8 +702,37 @@ def build_argv(exec_template, prompt, item):
             for tok in shlex.split(exec_template)]
 
 
+def _safe(name):
+    """Item name as a filename component - an item name is caller-supplied and
+    must never escape the run directory."""
+    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in name)[:80] or "item"
+
+
+def _write_state(run_dir, state):
+    """Persist after EVERY completion, not at the end. The point of state on disk
+    is that an interrupted run - a crash, a kill, a caller that ran out of room
+    and handed over to a fresh one - can be resumed from it. State that is only
+    written at the end is exactly the state you do not have when you need it."""
+    if not run_dir:
+        return
+    tmp = os.path.join(run_dir, "state.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, os.path.join(run_dir, "state.json"))  # atomic: never half-written
+
+
+def load_state(run_dir):
+    """Previously recorded item outcomes, for --resume."""
+    try:
+        with open(os.path.join(run_dir, "state.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
-             prompt_template=None, cwd=None, poll=0.2):
+             prompt_template=None, cwd=None, poll=0.2, run_dir=None,
+             resume=False, max_output=4000, contract=RETURN_CONTRACT):
     """Dispatch every item whose predecessors have SUCCEEDED, up to `concurrency`
     at once, unlocking dependents as each finishes - the `ready_after` DAG driven
     directly, so nothing idles behind an unrelated slow neighbour. Dispatch order
@@ -688,6 +749,26 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
     packs, tier = plan_obj.get("context_packs", {}), plan_obj.get("tier", {})
     pending = [n for w in plan_obj.get("waves", []) for n in w]
     status, running, records = {}, {}, []
+    pid = plan_obj.get("plan_id") or plan_id(plan_obj)
+
+    state = {"plan_id": pid, "items": {}}
+    if run_dir and not dry_run:
+        os.makedirs(os.path.join(run_dir, "items"), exist_ok=True)
+        with open(os.path.join(run_dir, "plan.json"), "w", encoding="utf-8") as f:
+            json.dump(plan_obj, f, indent=2)   # the plan IS the state: keep it beside the log
+        if resume:
+            prior = load_state(run_dir)
+            if prior.get("plan_id") not in (None, pid):
+                raise ValueError("--resume against a DIFFERENT plan (%s != %s): the "
+                                 "work-set changed, so prior results do not apply"
+                                 % (prior.get("plan_id"), pid))
+            state["items"] = prior.get("items", {})
+            done = [n for n, r in state["items"].items() if r.get("status") == "ok"]
+            for n in done:
+                if n in pending:
+                    pending.remove(n)
+                status[n] = "ok"
+                records.append({"item": n, "status": "resumed", "exit": 0})
 
     def ok(n):
         return all(status.get(d) == "ok" for d in deps.get(n, []))
@@ -696,17 +777,37 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
         return any(status.get(d) in ("failed", "blocked") for d in deps.get(n, []))
 
     while pending or running:
-        for name in [n for n, (p, _) in running.items() if p.poll() is not None]:
-            proc, started = running.pop(name)
+        for name in [n for n, (p, _, _) in running.items() if p.poll() is not None]:
+            proc, started, handles = running.pop(name)
+            for h in handles:
+                h.close()
             status[name] = "ok" if proc.returncode == 0 else "failed"
-            records.append({"item": name, "status": status[name],
-                            "exit": proc.returncode,
-                            "seconds": round(time.time() - started, 2)})
+            record = {"item": name, "status": status[name], "exit": proc.returncode,
+                      "seconds": round(time.time() - started, 2)}
+            if run_dir:
+                out_path = os.path.join(run_dir, "items", "%s.out" % _safe(name))
+                try:
+                    with open(out_path, encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                except OSError:
+                    text = ""
+                returned = parse_return(text)
+                if returned:
+                    record["returned"] = returned      # the bounded, structured half
+                record["output_file"] = out_path       # the unbounded half stays on disk
+                if not returned and text:
+                    record["output_tail"] = text[-max_output:]
+            records.append(record)
+            state["items"][name] = record
+            _write_state(run_dir, state)
         for n in [n for n in pending if doomed(n)]:
             pending.remove(n)
             status[n] = "blocked"
-            records.append({"item": n, "status": "blocked",
-                            "reason": "a predecessor did not succeed"})
+            blocked = {"item": n, "status": "blocked",
+                       "reason": "a predecessor did not succeed"}
+            records.append(blocked)
+            state["items"][n] = blocked
+            _write_state(run_dir, state)
         while len(running) < concurrency:
             nxt = next((n for n in pending if ok(n)), None)
             if nxt is None:
@@ -714,13 +815,30 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
             pending.remove(nxt)
             item = by_name.get(nxt) or {"name": nxt, "files": []}
             prompt = render_prompt(item, packs.get(nxt, {}),
-                                   tier.get(nxt, "cheap"), prompt_template)
+                                   tier.get(nxt, "cheap"), prompt_template, contract)
             argv = build_argv(exec_template, prompt, item)
             if dry_run:
                 status[nxt] = "ok"
                 records.append({"item": nxt, "status": "dry-run", "argv": argv})
             else:
-                running[nxt] = (subprocess.Popen(argv, cwd=cwd), time.time())
+                # Output goes to a FILE, never to the caller's stream: a worker that
+                # decides to narrate must not be able to flood whoever is watching.
+                # A worker needs to know which item it IS to satisfy the return
+                # contract; the name is in the prompt, but a non-LLM worker (a
+                # script, a wrapper) should not have to parse prose to find it.
+                env = dict(os.environ, FANOUT_ITEM=nxt, FANOUT_PLAN_ID=pid,
+                           FANOUT_TIER=tier.get(nxt, "cheap"),
+                           FANOUT_FILES=",".join(item.get("files", [])))
+                handles = []
+                if run_dir:
+                    out = open(os.path.join(run_dir, "items", "%s.out" % _safe(nxt)),
+                               "w", encoding="utf-8")
+                    handles = [out]
+                    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out,
+                                            stderr=subprocess.STDOUT)
+                else:
+                    proc = subprocess.Popen(argv, cwd=cwd, env=env)
+                running[nxt] = (proc, time.time(), handles)
         if running:
             if not dry_run:
                 time.sleep(poll)
@@ -733,9 +851,12 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
     counts = defaultdict(int)
     for r in records:
         counts[r["status"]] += 1
-    return {"plan_id": plan_obj.get("plan_id") or plan_id(plan_obj),
-            "concurrency": concurrency, "dispatched": records,
-            "summary": dict(counts)}
+    _write_state(run_dir, state)
+    result = {"plan_id": pid, "concurrency": concurrency,
+              "dispatched": records, "summary": dict(counts)}
+    if run_dir:
+        result["run_dir"] = run_dir
+    return result
 
 
 def main():
@@ -788,6 +909,23 @@ def main():
     ap.add_argument("--run-log", default=None,
                     help="with --exec: write the dispatch record as JSONL, so what "
                          "ACTUALLY ran can be checked against the plan")
+    ap.add_argument("--run-dir", default=None,
+                    help="with --exec: keep the run's STATE on disk here (plan.json, "
+                         "state.json, items/<name>.out). Default .fanout/<plan_id>. "
+                         "State is written after every completion, so an interrupted "
+                         "run is resumable and a caller need not hold it in context.")
+    ap.add_argument("--no-run-dir", action="store_true",
+                    help="do not persist run state (worker output goes to this "
+                         "process's stdout instead)")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip items already recorded ok in --run-dir; refuses to "
+                         "resume across a different plan_id")
+    ap.add_argument("--max-output-bytes", type=int, default=4000,
+                    help="how much of a worker's raw output to keep in the record "
+                         "when it returned no structured line (default 4000)")
+    ap.add_argument("--no-return-contract", action="store_true",
+                    help="do not ask workers for a structured one-line result "
+                         "(they will return prose, which is what bloats a caller)")
     args = ap.parse_args()
     with open(args.items, encoding="utf-8") as f:
         items = json.load(f)
@@ -805,8 +943,14 @@ def main():
     if not args.exec_template:
         print(json.dumps(computed, indent=2))
         return
+    run_dir = None
+    if not args.no_run_dir and not args.dry_run:
+        run_dir = args.run_dir or os.path.join(
+            ".fanout", computed.get("plan_id") or plan_id(computed))
     result = run_plan(computed, items, args.exec_template, args.concurrency,
-                      args.dry_run, args.prompt_template)
+                      args.dry_run, args.prompt_template, run_dir=run_dir,
+                      resume=args.resume, max_output=args.max_output_bytes,
+                      contract=None if args.no_return_contract else RETURN_CONTRACT)
     if args.run_log:
         with open(args.run_log, "w", encoding="utf-8") as f:
             for record in result["dispatched"]:

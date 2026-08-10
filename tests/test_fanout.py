@@ -1,6 +1,9 @@
 import json
 import os
+import shlex
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -405,6 +408,92 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(a["plan_id"], fp.plan(self.ITEMS, None, [])["plan_id"])
         b = fp.plan(self.ITEMS, None, ["p.py"])  # different tiers -> different plan
         self.assertNotEqual(a["plan_id"], b["plan_id"])
+
+
+class BoundedReturnAndStateTests(unittest.TestCase):
+    """Two levers against caller-context bloat: workers return a SMALL fixed
+    shape, and the run's state lives on DISK so nobody has to hold it."""
+
+    ITEMS = [{"name": "A", "files": ["a.py"]},
+             {"name": "B", "files": ["b.py"], "after": ["A"]}]
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def test_prompt_carries_the_return_contract(self):
+        out = fp.render_prompt({"name": "A", "files": ["a.py"]}, {}, "cheap")
+        self.assertIn("ONE line of JSON", out)
+        self.assertIn('"files_changed"', out)
+
+    def test_contract_can_be_disabled(self):
+        out = fp.render_prompt({"name": "A", "files": ["a.py"]}, {}, "cheap", contract=None)
+        self.assertNotIn("ONE line of JSON", out)
+
+    def test_parse_return_takes_the_last_json_line_and_ignores_narration(self):
+        text = ('Thinking about it...\nI edited some files.\n'
+                '{"item":"A","status":"ok","files_changed":["a.py"]}')
+        self.assertEqual(fp.parse_return(text)["item"], "A")
+        self.assertIsNone(fp.parse_return("no json at all"))
+        self.assertIsNone(fp.parse_return('{"broken": '))
+
+    def test_worker_output_goes_to_disk_and_the_record_stays_small(self):
+        plan_obj = fp.plan(self.ITEMS, None, [])
+        noisy = 'printf "%s\\n" $(seq 1 500); printf \'{"item":"x","status":"ok"}\\n\''
+        res = fp.run_plan(plan_obj, self.ITEMS, "bash -c %s" % shlex.quote(noisy),
+                          concurrency=2, run_dir=self.dir)
+        rec = next(r for r in res["dispatched"] if r["item"] == "A")
+        self.assertEqual(rec["returned"]["status"], "ok")   # structured half kept
+        self.assertNotIn("output_tail", rec)                # bulk NOT in the record
+        self.assertTrue(os.path.exists(rec["output_file"])) # bulk IS on disk
+        self.assertGreater(os.path.getsize(rec["output_file"]), 1000)
+
+    def test_unstructured_output_is_truncated_not_dropped(self):
+        plan_obj = fp.plan([self.ITEMS[0]], None, [])
+        res = fp.run_plan(plan_obj, [self.ITEMS[0]],
+                          "bash -c %s" % shlex.quote('printf "%s\\n" $(seq 1 900)'),
+                          run_dir=self.dir, max_output=200)
+        rec = res["dispatched"][0]
+        self.assertLessEqual(len(rec["output_tail"]), 200)
+        self.assertTrue(os.path.exists(rec["output_file"]))
+
+    def test_state_is_written_to_disk_with_the_plan(self):
+        plan_obj = fp.plan(self.ITEMS, None, [])
+        fp.run_plan(plan_obj, self.ITEMS, "true", run_dir=self.dir)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "plan.json")))
+        state = fp.load_state(self.dir)
+        self.assertEqual(state["plan_id"], plan_obj["plan_id"])
+        self.assertEqual(state["items"]["A"]["status"], "ok")
+
+    def test_resume_skips_completed_work(self):
+        plan_obj = fp.plan(self.ITEMS, None, [])
+        fp.run_plan(plan_obj, self.ITEMS, "true", run_dir=self.dir)
+        # `false` would fail everything - anything already ok must not be re-run
+        again = fp.run_plan(plan_obj, self.ITEMS, "false", run_dir=self.dir, resume=True)
+        self.assertEqual(again["summary"].get("resumed"), 2)
+        self.assertNotIn("failed", again["summary"])
+
+    def test_resume_refuses_a_different_plan(self):
+        """Prior results describe a different work-set; reusing them would report
+        work as done that this plan never ran."""
+        fp.run_plan(fp.plan(self.ITEMS, None, []), self.ITEMS, "true", run_dir=self.dir)
+        changed = [{"name": "A", "files": ["a.py"]}, {"name": "C", "files": ["c.py"]}]
+        with self.assertRaises(ValueError):
+            fp.run_plan(fp.plan(changed, None, []), changed, "true",
+                        run_dir=self.dir, resume=True)
+
+    def test_worker_is_told_which_item_it_is(self):
+        """A script worker must not have to parse the prompt to identify itself."""
+        plan_obj = fp.plan([self.ITEMS[0]], None, [])
+        res = fp.run_plan(plan_obj, [self.ITEMS[0]],
+                          "bash -c %s" % shlex.quote(
+                              'printf \'{"item":"%s","status":"ok"}\\n\' "$FANOUT_ITEM"'),
+                          run_dir=self.dir)
+        self.assertEqual(res["dispatched"][0]["returned"]["item"], "A")
+
+    def test_item_name_cannot_escape_the_run_directory(self):
+        self.assertNotIn("/", fp._safe("../../etc/passwd"))
+        self.assertTrue(fp._safe("../../etc/passwd"))
 
 
 if __name__ == "__main__":

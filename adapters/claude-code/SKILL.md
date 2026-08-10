@@ -55,6 +55,35 @@ The runner guarantees DISPATCH - order, concurrency, dependencies. It says
 nothing about whether the spawned agent did good work; review and the
 verification gates still apply exactly as before.
 
+### Keeping the ORCHESTRATOR's context small
+
+An orchestrator's context grows from what its workers hand back, and every turn
+re-sends that context - so unbounded worker reports are the dominant cost of a
+long run, and the least visible one (each report looks reasonable on its own).
+Two mechanisms bound it:
+
+- **A return contract.** Each worker is asked for ONE line of JSON
+  (`{item, status, files_changed, receipt, notes}`). The runner keeps that
+  structured line in the record and leaves everything else in
+  `<run-dir>/items/<name>.out`. Measured on a deliberately chatty worker: 343
+  bytes in the record against 15 KB on disk. `--no-return-contract` opts out.
+  **When you dispatch subagents yourself rather than via `--exec`, ask for the
+  same shape** - the lever is the bounded return, not the runner.
+- **Run state on disk.** `--run-dir` (default `.fanout/<plan_id>`) holds
+  `plan.json`, `state.json` and per-item output, written after EVERY completion.
+  So the run's state does not have to live in anyone's context, an interrupted
+  run resumes with `--resume`, and a handoff to a fresh orchestrator is a
+  directory rather than a summary. `--resume` refuses to run against a different
+  `plan_id`, because prior results describe a different work-set.
+
+Workers are given `FANOUT_ITEM`, `FANOUT_PLAN_ID`, `FANOUT_TIER` and
+`FANOUT_FILES` in their environment, so a script worker can satisfy the contract
+without parsing its prompt.
+
+**Do not hand a run off mid-item.** Reproduce-then-verify evidence has to sit in
+ONE transcript for a verification gate to see both halves; hand over at item
+boundaries only.
+
 - `--graph` (optional): a graphify `graph.json` (node-link). Per-repo, or the
   merged multi-repo graph (run graphify from the repos' common parent dir).
   Missing/absent graph = the plan loses ONLY the `import-adjacent` coupling
