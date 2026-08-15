@@ -110,8 +110,9 @@ itself is the product; adapters are thin.
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE.md) — free to use, modify and share for
-any noncommercial purpose. Selling it, or using it commercially, requires a
-separate license: open an issue.
+[Apache 2.0](LICENSE) — free to use, modify, and share, including commercially.
+Keep the [`NOTICE`](NOTICE) file with any redistribution (§4(d)), and don't market
+a fork under the `fanout` name (§6). The patent grant in §3 means adopting this
+doesn't expose you to a patent claim over it.
 
 Required Notice: Copyright Shaheer Shoaib (https://github.com/shaheershoaib)
