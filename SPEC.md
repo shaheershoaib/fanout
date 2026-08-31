@@ -4,8 +4,7 @@
 
 Today fanout is a scheduler: you hand it items **with their files already
 predicted**, and it clusters and schedules them. Deriving those files lives in
-the caller (`ship`'s step 0 recon), which is why fanout alone leaves an adopter
-writing a harness.
+the caller, which is why fanout alone leaves an adopter writing a harness.
 
 v2 moves that derivation in. Fanout takes plain text asks and carries them to
 open draft PRs. It still never merges, deploys, or verifies.
@@ -352,12 +351,13 @@ Merge stays out for a reason that is not portability — it is a judgment (revie
 passed, CI green, blast radius acceptable), and that is the trust boundary.
 Branch, push and PR-open are mechanisms; merge is a decision.
 
-## Consequence for shipping consumers
+## What this leaves to a consumer
 
-A verification consumer (`ship` and equivalents) loses its planning half —
-enumeration recon, worktrees, branches, commits, PR-open — and keeps the
-verification half: reproduce and pin the acceptance line, merge judgment,
-deploy-verify the sha, verify by value on the target, close out, record the
-trajectory. It stops being half-planner and half-referee, and becomes the
-referee: from "there is an open PR" to "the symptom is observably gone on the
-deployed build."
+Fanout stops at open draft PRs. Everything after that is a consumer's: reviewing
+the diff, deciding to merge, confirming the deploy carries the merged sha, and
+checking the change actually did what was asked on the running system.
+
+That split is deliberate rather than incidental. Fanout's half is mechanical and
+re-runnable from the same inputs; the other half is judgement about whether the
+work is right, which is not a scheduling problem and does not belong in a
+scheduler.

@@ -17,6 +17,22 @@ Use `--exec` when you want the plan EXECUTED rather than followed by hand; leave
 off when the consumer is doing its own dispatching.
 
 ## Use it
+
+**From plain asks (fanout does the recon):**
+
+`python3 ~/.claude/skills/fanout/fanout.py --asks <asks.txt> --recon-exec 'claude -p {prompt}' [--graph <graph.json>] --emit-items items.json --risk-markers <a,b,c>`
+
+One ask per line. Fanout runs one recon worker per ask, in parallel, and each
+returns the leaves that ask decomposes into - with a `task`, the files it will
+edit, `file_notes`, a `complexity` and an `acceptance` line. Recon resolves
+files in this order: **the graphify graph if `--graph` names one** (it is told
+the path and told to query it first), then grep for the named surface, then -
+for net-new work with nothing to grep - the directory structure. `--emit-items`
+writes the derived items so they can be read and corrected before anything is
+built.
+
+**From items you already have:**
+
 `python3 ~/.claude/skills/fanout/fanout.py --items <items.json> [--graph <graph.json>] --risk-markers <a,b,c> [--serial-verify-markers <d,e>] [--trajectories <store.jsonl> | --no-trajectories]`
 
 Each item may carry an optional `complexity` (`simple` | `complex`) and `type`
@@ -38,6 +54,20 @@ quietly ignore - usually by running a parallel plan serially, which looks
 identical in a transcript and loses the whole speed win. `--exec` dispatches it:
 
 `... --exec 'claude -p {prompt}' --concurrency 4 [--dry-run] [--run-log run.jsonl]`
+
+**One branch per MSP is not a flag - it is what "one MSP = one PR" means.**
+`--exec` cuts a branch and a git worktree for every MSP off `--base` (default:
+the current branch), and dispatches that MSP's clusters inside it. The clusters
+of one MSP share its tree, which is safe because they are file-disjoint by
+construction. When an MSP's LAST cluster succeeds, its work is committed,
+pushed, and handed to `--pr-exec`:
+
+`--pr-exec 'gh pr create --draft --base {base} --head {branch} --title {title}'`
+
+A failed cluster blocks its MSP, so a half-built MSP never commits and never
+opens a PR. `--no-push` commits without pushing; `--no-branches` is an escape
+hatch for a scratch repo or a non-git directory, and it is reported in the
+result rather than silently producing no branches.
 
 It dispatches **one agent per CLUSTER**, not per item - the cluster is the unit
 one agent owns, and everything that must serialize is already inside it. A
@@ -149,6 +179,13 @@ Output JSON:
   converges into one branch and cannot span two. Independent items come out as
   clusters of one, which is the common case and the best one.
   **BREAKING: `clusters` used to mean what `msps` now means.**
+- `cluster_briefs`: **what each subagent must be told.** One entry per cluster:
+  its `leaves`, the `msp` it belongs to, its `tier`, the clusters it waits on,
+  and a ready-to-send `prompt`. `--exec` sends exactly this, so an orchestrator
+  spawning its OWN subagents sends the same thing rather than reconstructing it
+  and telling them less. On by default; `--no-briefs` omits them when you only
+  want the shape of the plan, since each carries a full prompt and they dominate
+  the output on a wide batch.
 - `cluster_after`: cluster index -> the clusters whose build must finish first.
   Carried by the CLUSTER that needs it, never by its MSP: if one of B's five
   leaves depends on A, that leaf's cluster waits and B's other four start at
