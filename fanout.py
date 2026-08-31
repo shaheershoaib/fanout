@@ -644,7 +644,7 @@ def plan_id(plan_obj):
 RETURN_CONTRACT = (
     'When finished, print ONE line of JSON and nothing after it:\n'
     '{"item":"<name>","status":"ok"|"failed","files_changed":["path",...],'
-    '"receipt":"<how you proved it works>","notes":"<=200 chars"}\n'
+    '"notes":"<=200 chars"}\n'
     'Keep it short. Anything outside that line is recorded but not read back.'
 )
 

@@ -63,7 +63,7 @@ long run, and the least visible one (each report looks reasonable on its own).
 Two mechanisms bound it:
 
 - **A return contract.** Each worker is asked for ONE line of JSON
-  (`{item, status, files_changed, receipt, notes}`). The runner keeps that
+  (`{item, status, files_changed, notes}`). The runner keeps that
   structured line in the record and leaves everything else in
   `<run-dir>/items/<name>.out`. Measured on a deliberately chatty worker: 343
   bytes in the record against 15 KB on disk. `--no-return-contract` opts out.
