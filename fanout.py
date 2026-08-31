@@ -1648,6 +1648,21 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
               "dispatched": records, "summary": dict(counts)}
     if msp_results:
         result["msps"] = msp_results
+
+    # Check the prediction the whole plan rested on. Recon is an LLM, so the
+    # file lists are a guess, and this is the only thing that ever tells you a
+    # guess was wrong. Leaving it as a library function nobody calls made the
+    # guarantee ("you are told when recon was wrong") true only for a caller
+    # who knew to go looking.
+    actual = {}
+    for rec in records:
+        for ret in (rec.get("returns") or ([rec["returned"]] if rec.get("returned")
+                                           else [])):
+            name, changed = ret.get("item"), ret.get("files_changed")
+            if name in by_name and isinstance(changed, list):
+                actual[name] = changed
+    if actual:
+        result["reconcile"] = reconcile(items, clusters, actual)
     if run_dir:
         result["run_dir"] = run_dir
     return result
@@ -1851,6 +1866,11 @@ def main():
     print(json.dumps(result, indent=2))
     # a failed or blocked item must not exit 0 - a green exit is a claim
     if result["summary"].get("failed") or result["summary"].get("blocked"):
+        raise SystemExit(1)
+    # nor may a cross-MSP collision: every cluster succeeded, and the PLAN was
+    # still wrong - two MSPs were not disjoint and ran in parallel anyway. That
+    # is the failure this tool exists to prevent, so it cannot exit 0.
+    if result.get("reconcile", {}).get("collisions"):
         raise SystemExit(1)
 
 

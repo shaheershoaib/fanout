@@ -310,9 +310,10 @@ across waves and WITHIN one, since a wave wider than your concurrency cap queues
   history bump) and `complexity` when the item supplies it. `cheap` requires BOTH
   mechanical and low-blast-radius: path markers alone send the capable model to
   one-word copy changes and the cheap model to hard refactors.
-- After a run, feed the returned `files_changed` back through `reconcile(items,
-  clusters, actual)`. The whole plan rests on PREDICTED files; reconcile is what
-  turns that from an assumption into something checked. A miss inside an item's
+- Every run reconciles ITSELF - no flag, nothing to remember. The result carries
+  `reconcile`, comparing predicted files against what each cluster reported
+  changing, and a cross-MSP collision exits NON-ZERO even when every cluster
+  succeeded: the clusters all worked and the PLAN was still wrong. A miss inside an item's
   own MSP is noise; a miss landing in another MSP's file set means the two were
   not disjoint and the plan parallelized a real collision.
 - **VERIFY-MODE: fan out the verification the same way you fan out the build (the
