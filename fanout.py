@@ -1005,9 +1005,14 @@ Each item is one LEAF - the smallest piece one agent can build in one sitting:
   name            short kebab-case id, unique
   task            what to DO, specific enough for an agent with NO other
                   context to act on. This is the entire brief it will get.
-  files           every file the work will EDIT. Include central registries a
-                  new feature must touch - router, DI container, index barrel,
-                  migrations dir - which nothing in the request will mention.
+  files           every file the work will EDIT. Include whatever this project
+                  makes new work register itself in - the file that lists,
+                  exports, wires or enumerates things of that kind. Nothing in
+                  the request will mention it, and it is the file two unrelated
+                  additions most often collide in. Find it by looking at how an
+                  EXISTING thing of the same kind is hooked up, rather than by
+                  guessing a name: whatever that one had to touch, yours will
+                  too.
   file_notes      {path: what changes in that file}, for each file above
   type            fix | feature | port | design | sweep | contract
   complexity      simple  (mechanical, fully specified)

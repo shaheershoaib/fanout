@@ -91,13 +91,18 @@ sequentially. Everything below follows from that.
 
    Every path returns the same schema, tagged with its `source`.
 
-   **Registration files are always predicted for net-new items.** A new feature
-   almost always edits a central registry — a router, a DI container, an
-   `index` barrel, a migrations directory — and no structural or grep pass
-   infers that from the ask. Recon must add the project's registration and
-   entrypoint files to any `feature` or `port` item by default. Two net-new
-   items both silently editing `router.tsx` is a genuine cross-MSP collision
-   that grouping would otherwise never see.
+   **Registration files are always predicted for net-new items.** Nearly every
+   project has somewhere that new work must register itself — a file that
+   lists, exports, wires or enumerates things of its kind — and what that is
+   differs completely by stack. No structural or grep pass infers it from the
+   ask, because the ask never mentions it.
+
+   The reliable way to find it is not a name but a precedent: look at how an
+   EXISTING thing of the same kind is hooked up, and whatever that one had to
+   touch, this one will too. Recon adds those files to any `feature` or `port`
+   item by default. Two net-new items silently editing one shared registry is a
+   genuine cross-MSP collision that grouping would otherwise never see — and it
+   is the single most common way a plan that looked disjoint was not.
 3. **Fuse MSPs whose leaves collide** — a consequence of one structural rule,
    not a separate safety net: **a cluster cannot span two MSPs**, because a
    cluster converges into one branch and one PR. Two leaves editing the same
