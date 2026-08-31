@@ -54,8 +54,8 @@ own PR and invites a partial merge.
 
 ```mermaid
 flowchart TB
-  A["plain text asks"] --> R["<b>recon</b><br/>graphify → grep → structural<br/><i>one ask may split into several items</i>"]
-  R --> G["<b>group into MSPs</b><br/>shared file or contract_group<br/>+ shippability test"]
+  A["plain text asks"] --> R["<b>recon</b> <i>(top-down)</i><br/>MSP boundary + its leaves<br/>files via graphify → grep → structural"]
+  R --> G["<b>merge colliding MSPs</b><br/><i>safety net: shared file or<br/>contract_group fuses two.<br/>merge-only, never split</i>"]
   G --> S["<b>split each MSP into clusters</b><br/><i>connected dependency components:<br/>one owner, sequential inside,<br/>independent of every other cluster</i>"]
   S --> T["<b>tier</b><br/>blast radius × complexity"]
   T --> D["<b>dispatch</b><br/>one process per cluster"]
@@ -69,13 +69,17 @@ flowchart TB
   style C fill:#bf872922,stroke:#bf8729
 ```
 
-Order matters: **discovery precedes clustering.** MSPs are computed *from* file
-overlap, so files must exist before grouping can happen.
+**MSP boundaries are semantic, and recon draws them.** "What merges coherently
+on its own" is readable from the ask itself, before any file has been looked at.
+File overlap does not *define* an MSP — it can only ever **merge** two that
+recon proposed separately and that turn out to collide. Merge-only, never
+split.
 
 1. **Ingest** — plain text asks.
-2. **Recon** — one ask may yield **several items**; recon splits as well as
-   describes. Per item, derive `files`, `type`, and an `acceptance` line.
-   Resolution order:
+2. **Recon** — top-down, in one pass: read each ask, decide the **MSP** it
+   represents (the shippability test below), and enumerate that MSP's **leaves**.
+   One ask may yield several MSPs, and an MSP has one or more leaves. Per leaf,
+   derive `files`, `type`, and an `acceptance` line. Resolution order for files:
    - **graphify** — query the item's neighbourhood in `graph.json`.
    - **grep** — search the codebase for the named surface.
    - **structural** — for net-new work there is nothing to grep; reason from
@@ -90,8 +94,10 @@ overlap, so files must exist before grouping can happen.
    entrypoint files to any `feature` or `port` item by default. Two net-new
    items both silently editing `router.tsx` is a genuine cross-MSP collision
    that grouping would otherwise never see.
-3. **Group into MSPs** — union items sharing an edited file or a
-   `contract_group`, then apply the shippability test above.
+3. **Merge colliding MSPs** — the safety net, not the definition. If two MSPs
+   recon proposed separately share an edited file or a `contract_group`, they
+   fuse into one, because two open PRs must never edit the same file. This step
+   only ever reduces the MSP count.
 4. **Split each MSP into clusters** — a cluster is a **weakly-connected
    component of the dependency graph** within the MSP: one owner, sequential
    inside, and independent of every other cluster by construction, **subject to
