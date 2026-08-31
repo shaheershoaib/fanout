@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: Use whenever 2+ work-items are on the table in one session - a board with several Open tickets, a multi-finding fix wave, several asks in one or successive user messages - BEFORE starting any of them, and AGAIN when new items arrive mid-session (re-batch; do not queue new asks behind the current item). Not just for when a fan-out is already decided - this tool is HOW you decide: it computes the MSPs (one MSP = one branch = one PR), splits each into clusters (the unit one agent owns and walks sequentially), carries dependency edges at cluster granularity so one blocked leaf never gates its siblings, and tiers each cluster by blast radius x complexity. Consumed by ship (step 0) and proto-port (plan step). The project supplies the risk-marker taxonomy and any graph path; this tool bakes in no project paths.
+description: Use whenever 2+ work-items are on the table in one session - a board with several Open tickets, a multi-finding fix wave, several asks in one or successive user messages - BEFORE starting any of them, and AGAIN when new items arrive mid-session (re-batch; do not queue new asks behind the current item). Not just for when a fan-out is already decided - this tool is HOW you decide: it computes the MSPs (one MSP = one branch = one PR), splits each into clusters (the unit one agent owns and walks sequentially), carries dependency edges at cluster granularity so one blocked leaf never gates its siblings, and tiers each cluster by blast radius x complexity. Stack-agnostic: it reasons about edited files and declared dependencies, never about what kind of thing is being built. The project supplies the risk-marker taxonomy and any graph path; this tool bakes in no project paths.
 ---
 
 # fanout
@@ -8,11 +8,11 @@ description: Use whenever 2+ work-items are on the table in one session - a boar
 Turn "fan out only on disjoint files" from manual judgment into a computed plan -
 and, with `--exec`, into the dispatch itself.
 
-**Boundary: fanout schedules and (optionally) dispatches; `ship` owns the job.**
+**Boundary: fanout takes stated work to open draft PRs; a consumer takes it from there.**
 It plans in seconds, deterministically, and touches no git and ships nothing. With
 `--exec` it will spawn one process per item along the dependency DAG, but it still
 never commits, merges, gates or closes anything - the gated spine, verification and
-close-outs stay with the CONSUMER (`ship` for work-sets, `proto-port` for ports).
+close-outs stay with the CONSUMER - whatever your setup uses to prove a change is right.
 Use `--exec` when you want the plan EXECUTED rather than followed by hand; leave it
 off when the consumer is doing its own dispatching.
 
@@ -360,6 +360,7 @@ across waves and WITHIN one, since a wave wider than your concurrency cap queues
   precise joins.
 
 ## Related
-- `ship` (step 0 + batching), `proto-port` (plan step) - the consumers.
-- `graphify` - produces the `graph.json` this reads.
+- Whatever your setup uses to review, merge and verify - fanout stops at the
+  draft PR and that half is a consumer's.
+- `graphify` - produces the optional `graph.json` this reads.
 - A trajectory-memory store (whichever MCP/plugin the setup provides) - the optional history this reads for history-aware tiering + the `regression-history` coupling signal.

@@ -102,6 +102,11 @@ It returns:
 | `verify_mode` | whether a task's check needs a live session or can be offloaded |
 | `plan_id` | a hash, so a run log can be tied to the plan it claims to have run |
 
+**Nothing here is stack-specific.** fanout reasons about edited files and
+declared dependencies, and never about what kind of thing is being built. A
+library, a CLI, a service, a data pipeline and a web app all plan the same way:
+the examples happen to be web-shaped, the tool is not.
+
 **Merge safety keys on the edited FILE.** Not on symbols, not on transitive
 imports. Graph-driven impact analysis was tried and rejected: transitive coupling
 collapses a real codebase into one serial blob and destroys the parallelism you
