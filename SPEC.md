@@ -179,8 +179,17 @@ that can stall is a scheduler that can deadlock.
 first is a *merge*-ordering concern, handled at the PR level as stacked MSPs —
 and fanout does not merge.
 
-`waves` and `ready_after` may stay in the output for backward compatibility, but
-nothing in v2 schedules off them.
+### What happens to the two scheduling outputs
+
+- **`waves` is removed.** It described a barrier that v2 has no way to express
+  and no reason to want. Nothing emits it, nothing reads it.
+- **`ready_after` survives with a smaller job.** Between clusters it would
+  always be empty, so it is no longer a schedule. It becomes the **order inside
+  a cluster** — the sequence handed to the owning agent so it knows which leaf
+  to build first and which depends on what it just finished.
+
+So the only ordering left in the system is ordering *within one agent's own
+work*. Nothing in v2 waits on anything.
 
 ## Item schema
 
