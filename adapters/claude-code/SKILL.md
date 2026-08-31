@@ -65,7 +65,13 @@ pushed, and handed to `--pr-exec`:
 `--pr-exec 'gh pr create --draft --base {base} --head {branch} --title {title}'`
 
 A failed cluster blocks its MSP, so a half-built MSP never commits and never
-opens a PR. `--no-push` commits without pushing; `--no-branches` is an escape
+opens a PR.
+
+A cluster that depends on ANOTHER MSP waits for that MSP to be committed, not
+merely built, and its producer's branch is merged into this tree before the
+agent starts - otherwise the consumer would work in a different tree and build
+against the base revision, honouring the dependency in timing only. Its PR
+therefore stacks on the producer's. `--no-push` commits without pushing; `--no-branches` is an escape
 hatch for a scratch repo or a non-git directory, and it is reported in the
 result rather than silently producing no branches.
 
