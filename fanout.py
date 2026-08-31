@@ -755,7 +755,7 @@ def verify_modes(items, serial_markers):
 
 def plan(items, graph_path, risk_markers, trajectories=None,
          serial_verify_markers=None, context_hops=1, context_cap=40,
-         coalesce_below=2.0, coalesce_max=4):
+         coalesce_below=2.0, coalesce_max=4, briefs=True):
     """graph_path is OPTIONAL (None -> no import-adjacency signals; clustering,
     waves, tiers, and the marker/history coupling signals still compute)."""
     if graph_path:
@@ -809,27 +809,28 @@ def plan(items, graph_path, risk_markers, trajectories=None,
     # two consumers: an orchestrator that spawns its own subagents needs the
     # same thing, and if it has to reconstruct it, the two paths drift and the
     # hand-dispatched agents are the ones told less.
-    by_name = {it["name"]: it for it in items}
-    msp_index = {}
-    for i, group in enumerate(msps):
-        for n in group:
-            msp_index[n] = i
-    order = [n for w in waves for n in w]
-    edges = result["cluster_after"]
-    briefs = []
-    for i, members in enumerate(clusters):
-        ctier = "top" if any(tier.get(n) == "top" for n in members) else "cheap"
-        briefs.append({
-            "cluster": i,
-            "label": members[0] if len(members) == 1 else "cluster-%d" % i,
-            "msp": msp_index.get(members[0]),
-            "leaves": members,
-            "tier": ctier,
-            "after_clusters": edges.get(i, []),
-            "prompt": render_cluster_prompt(members, by_name, packs, ctier,
-                                            order, None, RETURN_CONTRACT),
-        })
-    result["cluster_briefs"] = briefs
+    if briefs:
+      by_name = {it["name"]: it for it in items}
+      msp_index = {}
+      for i, group in enumerate(msps):
+          for n in group:
+              msp_index[n] = i
+      order = [n for w in waves for n in w]
+      edges = result["cluster_after"]
+      built = []
+      for i, members in enumerate(clusters):
+          ctier = "top" if any(tier.get(n) == "top" for n in members) else "cheap"
+          built.append({
+              "cluster": i,
+              "label": members[0] if len(members) == 1 else "cluster-%d" % i,
+              "msp": msp_index.get(members[0]),
+              "leaves": members,
+              "tier": ctier,
+              "after_clusters": edges.get(i, []),
+              "prompt": render_cluster_prompt(members, by_name, packs, ctier,
+                                              order, None, RETURN_CONTRACT),
+          })
+      result["cluster_briefs"] = built
 
     # An item with no `task` dispatches an agent whose entire brief is a NAME.
     # That is a plan defect, and a silent one - the run looks normal and the
@@ -1475,6 +1476,14 @@ def main():
                          "Split into argv BEFORE substitution (no shell). "
                          "Placeholders: {prompt} {name} {files}. Omit to only print "
                          "the plan.")
+    ap.add_argument("--no-briefs", action="store_true",
+                    help="omit `cluster_briefs` from the plan. The briefs are "
+                         "what a subagent must be TOLD - leaves, files, tasks, "
+                         "acceptance - and an orchestrator dispatching its own "
+                         "agents needs them, so they are on by default. Drop "
+                         "them when you only want the shape of the plan: each "
+                         "one carries a full prompt, so they dominate the "
+                         "output on a wide batch.")
     ap.add_argument("--concurrency", type=int, default=4,
                     help="most items dispatched at once (default 4)")
     ap.add_argument("--dry-run", action="store_true",
@@ -1543,7 +1552,7 @@ def main():
         computed = plan(items, args.graph, markers, trajectories,
                         serial_markers, args.context_hops,
                         args.max_context_files, args.coalesce_below,
-                        args.coalesce_max)
+                        args.coalesce_max, briefs=not args.no_briefs)
     if recon_report is not None:
         computed["recon"] = recon_report
     if not args.exec_template:

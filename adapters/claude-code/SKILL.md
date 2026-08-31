@@ -169,7 +169,9 @@ Output JSON:
   its `leaves`, the `msp` it belongs to, its `tier`, the clusters it waits on,
   and a ready-to-send `prompt`. `--exec` sends exactly this, so an orchestrator
   spawning its OWN subagents sends the same thing rather than reconstructing it
-  and telling them less.
+  and telling them less. On by default; `--no-briefs` omits them when you only
+  want the shape of the plan, since each carries a full prompt and they dominate
+  the output on a wide batch.
 - `cluster_after`: cluster index -> the clusters whose build must finish first.
   Carried by the CLUSTER that needs it, never by its MSP: if one of B's five
   leaves depends on A, that leaf's cluster waits and B's other four start at

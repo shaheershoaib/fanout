@@ -802,6 +802,15 @@ class ClusterBriefs(unittest.TestCase):
         sent = res["dispatched"][0]["argv"][-1]
         self.assertEqual(sent, pl["cluster_briefs"][0]["prompt"])
 
+    def test_briefs_can_be_switched_off(self):
+        items = [{"name": "a", "files": ["x.py"], "task": "do a"}]
+        self.assertIn("cluster_briefs", fp.plan(items, None, [], trajectories=[]))
+        off = fp.plan(items, None, [], trajectories=[], briefs=False)
+        self.assertNotIn("cluster_briefs", off)
+        # and --exec still works without them, by rendering its own
+        res = fp.run_plan(off, items, "true {prompt}", dry_run=True)
+        self.assertIn("do a", res["dispatched"][0]["argv"][-1])
+
     def test_brief_names_the_msp_each_cluster_belongs_to(self):
         items = [{"name": "iface", "files": ["s.json"], "type": "contract",
                   "contract_group": "g", "task": "t"},
