@@ -496,5 +496,109 @@ class BoundedReturnAndStateTests(unittest.TestCase):
         self.assertTrue(fp._safe("../../etc/passwd"))
 
 
+
+
+class V2Planner(unittest.TestCase):
+    """MSPs vs clusters, the two-axis tier, and reconcile."""
+
+    def test_msp_fuses_on_shared_file_cluster_follows(self):
+        items = [{"name": "a", "files": ["x.py"]}, {"name": "b", "files": ["x.py"]}]
+        self.assertEqual([sorted(g) for g in fp.msp_items(items)], [["a", "b"]])
+        self.assertEqual([sorted(c) for c in fp.cluster_items(items)], [["a", "b"]])
+
+    def test_disjoint_items_are_clusters_of_one(self):
+        items = [{"name": "a", "files": ["x.py"]}, {"name": "b", "files": ["y.py"]}]
+        self.assertEqual(sorted(len(c) for c in fp.cluster_items(items)), [1, 1])
+
+    def test_pinned_contract_splits_into_parallel_clusters(self):
+        """One MSP (contract_group), three clusters: the pin exists so the two
+        halves run at once."""
+        items = [
+            {"name": "iface", "files": ["schema.json"], "type": "contract",
+             "contract_group": "login"},
+            {"name": "be", "files": ["api.py"], "contract_group": "login",
+             "after": ["iface"]},
+            {"name": "fe", "files": ["ui.tsx"], "contract_group": "login",
+             "after": ["iface"]},
+        ]
+        self.assertEqual(len(fp.msp_items(items)), 1)
+        clusters = fp.cluster_items(items)
+        self.assertEqual(len(clusters), 3, clusters)
+        # be and fe both wait on iface's cluster, and on nothing else
+        edges = fp.cluster_after(items, clusters)
+        self.assertEqual(len(edges), 2)
+        self.assertTrue(all(len(v) == 1 for v in edges.values()))
+
+    def test_unpinned_contract_serializes_under_one_owner(self):
+        items = [
+            {"name": "be", "files": ["api.py"], "contract_group": "login"},
+            {"name": "fe", "files": ["ui.tsx"], "contract_group": "login"},
+        ]
+        self.assertEqual([sorted(c) for c in fp.cluster_items(items)], [["be", "fe"]])
+
+    def test_cross_msp_chain_does_not_fuse(self):
+        """A cluster cannot span two MSPs, so even a plain a->b chain in two
+        MSPs stays two clusters joined by a dispatch edge."""
+        chain = [{"name": "a", "files": ["x.py"]},
+                 {"name": "b", "files": ["y.py"], "after": ["a"]}]
+        clusters = fp.cluster_items(chain)
+        self.assertEqual(len(clusters), 2)
+        self.assertEqual(len(fp.cluster_after(chain, clusters)), 1)
+
+    def test_single_consumer_pin_fuses_but_branching_pin_does_not(self):
+        """Pinning buys parallelism only when there are two halves to run at
+        once. With one consumer there is nothing to parallelize, so the chain
+        link fuses; with two, the halves stay separate."""
+        one = [
+            {"name": "iface", "files": ["s.json"], "type": "contract",
+             "contract_group": "g"},
+            {"name": "be", "files": ["api.py"], "contract_group": "g",
+             "after": ["iface"]},
+        ]
+        self.assertEqual(len(fp.cluster_items(one)), 1)
+        two = one + [{"name": "fe", "files": ["ui.tsx"], "contract_group": "g",
+                      "after": ["iface"]}]
+        self.assertEqual(len(fp.cluster_items(two)), 3)
+
+    def test_cross_msp_edge_is_carried_by_the_cluster_not_the_msp(self):
+        """One of B's leaves depends on A; B's other leaf must not wait."""
+        items = [
+            {"name": "a", "files": ["a.py"]},
+            {"name": "b_dep", "files": ["b1.py", "shared.py"], "after": ["a"]},
+            {"name": "b_free", "files": ["b2.py", "shared.py"]},
+        ]
+        clusters = fp.cluster_items(items)
+        edges = fp.cluster_after(items, clusters)
+        waiting = [i for i in range(len(clusters)) if i in edges]
+        self.assertEqual(len(waiting), 1)
+        # the waiting cluster is the one holding b_dep; a's cluster is free
+        self.assertIn("b_dep", clusters[waiting[0]])
+
+    def test_tier_two_axes(self):
+        self.assertEqual(fp.tier_for(["api/auth/x.py"], ["auth"], "simple"), "top")
+        self.assertEqual(fp.tier_for(["web/copy.ts"], ["auth"], "complex"), "top")
+        self.assertEqual(fp.tier_for(["web/copy.ts"], ["auth"], "simple"), "cheap")
+
+    def test_tier_without_complexity_is_unchanged(self):
+        self.assertEqual(fp.tier_for(["web/copy.ts"], ["auth"]), "cheap")
+        self.assertEqual(fp.tier_for(["api/auth/x.py"], ["auth"]), "top")
+
+    def test_reconcile_flags_only_cross_msp_misses(self):
+        items = [{"name": "a", "files": ["a.py"]}, {"name": "b", "files": ["b.py"]}]
+        clusters = fp.cluster_items(items)
+        noise = fp.reconcile(items, clusters, {"a": ["a.py", "a_helper.py"]})
+        self.assertTrue(noise["clean"])
+        self.assertEqual(noise["collisions"], 0)
+        hit = fp.reconcile(items, clusters, {"a": ["a.py", "b.py"]})
+        self.assertFalse(hit["clean"])
+        self.assertEqual(hit["collisions"], 1)
+        self.assertEqual(hit["findings"][0]["severity"], "collision")
+
+    def test_plan_emits_the_v2_keys(self):
+        items = [{"name": "a", "files": ["a.py"]}, {"name": "b", "files": ["b.py"]}]
+        pl = fp.plan(items, None, ["auth"], trajectories=[])
+        for key in ("msps", "clusters", "plan_id", "tier"):
+            self.assertIn(key, pl)
+
 if __name__ == "__main__":
     unittest.main()

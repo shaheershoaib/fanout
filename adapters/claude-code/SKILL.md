@@ -19,6 +19,13 @@ off when the consumer is doing its own dispatching.
 ## Use it
 `python3 ~/.claude/skills/fanout/fanout.py --items <items.json> [--graph <graph.json>] --risk-markers <a,b,c> [--serial-verify-markers <d,e>] [--trajectories <store.jsonl> | --no-trajectories]`
 
+Each item may carry an optional `complexity` (`simple` | `complex`) and `type`
+(`fix` | `feature` | `port` | `design` | `sweep` | `contract`). `complexity`
+feeds the tier's second axis; omit it and tiering falls back to blast radius
+alone, exactly as before. An item of `type: contract` inside a `contract_group`
+PINS that interface: its consumers then run in parallel against a fixed shape
+instead of serializing under one owner.
+
 Standalone by design: pure stdlib, no network, no runtime assumptions - JSON in,
 JSON out. Every project-specific input (risk markers, verify markers, graph,
 history store) is passed IN; nothing about any project or stack is baked in.
@@ -114,10 +121,28 @@ boundaries only.
   relaxes a tier or drops a signal.
 
 Output JSON:
-- `clusters`: lists of item names. Items in one cluster share an edited file OR a
-  declared `contract_group` -> MUST serialize. Distinct clusters are disjoint ->
-  safe to run in parallel.
-- `waves`: ONE GLOBAL execution schedule over ALL items (the batch's ordered
+- `msps`: lists of item names - the **top unit**, one MSP = one branch = one PR.
+  Items are fused into one MSP when they share an edited file OR a declared
+  `contract_group`, so two open PRs never touch the same file. This does not
+  DEFINE the boundary (that is a semantic call made upstream); it only FUSES two
+  that turn out to collide.
+- `clusters`: lists of item names - the **unit one agent owns** and walks
+  sequentially. A cluster is a connected component of the serialization graph:
+  a shared file or an UNPINNED `contract_group` fuses (undirected - must not run
+  at once, either order fine), and a single-consumer `after` link fuses (nothing
+  to parallelize). A BRANCHING `after` edge does not fuse, because splitting is
+  the whole point of it; nor does any edge across MSPs, since a cluster
+  converges into one branch and cannot span two. Independent items come out as
+  clusters of one, which is the common case and the best one.
+  **BREAKING: `clusters` used to mean what `msps` now means.**
+- `cluster_after`: cluster index -> the clusters whose build must finish first.
+  Carried by the CLUSTER that needs it, never by its MSP: if one of B's five
+  leaves depends on A, that leaf's cluster waits and B's other four start at
+  once. Every cluster NOT listed here starts immediately.
+- `waves`: **deprecated** - a barrier schedule, kept only so existing consumers
+  do not break. Dispatch off `clusters` + `cluster_after` instead: a barrier
+  makes an item wait on unrelated slow neighbours, an edge makes it wait only on
+  its actual predecessor. Historically: ONE GLOBAL execution schedule over ALL items (the batch's ordered
   plan). Items in one wave are mutually conflict-free (no shared file, no shared
   contract_group) AND have no `after` path between them -> run concurrently;
   each wave starts from the INTEGRATED result of the waves before it
@@ -210,7 +235,15 @@ across waves and WITHIN one, since a wave wider than your concurrency cap queues
   section is canonical - a serialize-together cluster ships as ONE PR; `after`
   orders separate MSPs without merging them.
 - Map `tier` to the model per leaf; the orchestrator + every review/gate/ship step
-  stays top-tier.
+  stays top-tier. `tier` now reads TWO axes - blast radius (path markers, plus a
+  history bump) and `complexity` when the item supplies it. `cheap` requires BOTH
+  mechanical and low-blast-radius: path markers alone send the capable model to
+  one-word copy changes and the cheap model to hard refactors.
+- After a run, feed the returned `files_changed` back through `reconcile(items,
+  clusters, actual)`. The whole plan rests on PREDICTED files; reconcile is what
+  turns that from an assumption into something checked. A miss inside an item's
+  own MSP is noise; a miss landing in another MSP's file set means the two were
+  not disjoint and the plan parallelized a real collision.
 - **VERIFY-MODE: fan out the verification the same way you fan out the build (the
   canonical rule, work-type-agnostic - fix, net-new feature, AND port all use it;
   it is the verify twin of the trust-boundary line above).** Read each leaf's
