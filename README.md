@@ -23,6 +23,24 @@ fanout computes the answer instead, deterministically, in milliseconds.
 
 ## What it computes
 
+```mermaid
+flowchart LR
+  I["items.json<br/><i>name · files · after</i>"] --> C["<b>group</b><br/>shared file<br/>or contract"]
+  G[("graph.json<br/><i>optional</i>")] -. hints .-> C
+  C --> S["<b>schedule</b><br/>waves<br/>ready_after"]
+  S --> T["<b>tier</b><br/>risk markers<br/>+ history"]
+  T --> X["<b>--exec</b><br/>one process per item,<br/>walked along the DAG"]
+  X --> R[("run-dir<br/><i>state · resume · run-log</i>")]
+
+  style C fill:#1f6feb22,stroke:#1f6feb
+  style S fill:#1f6feb22,stroke:#1f6feb
+  style T fill:#1f6feb22,stroke:#1f6feb
+```
+
+Everything left of `--exec` is deterministic and takes milliseconds. Nothing in
+this diagram touches git: fanout schedules and dispatches, and never commits,
+merges, gates or closes.
+
 Give it the items and the files each one will edit:
 
 ```json
