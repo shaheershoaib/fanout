@@ -169,7 +169,7 @@ class WavesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._waves(items)
 
-    def test_plan_emits_global_waves_and_clusters(self):
+    def test_plan_emits_msps_and_clusters_not_waves(self):
         import tempfile
         items = [
             {"name": "A", "files": ["f1.py"]},
@@ -184,18 +184,19 @@ class WavesTests(unittest.TestCase):
             out = fp.plan(items, graph_path, [])
         finally:
             os.unlink(graph_path)
-        self.assertIn("waves", out)
-        flat = [n for w in out["waves"] for n in w]
+        self.assertNotIn("waves", out)          # not emitted: ordering is internal
+        self.assertNotIn("ready_after", out)
+        flat = [n for c in out["clusters"] for n in c]
         self.assertEqual(sorted(flat), sorted(it["name"] for it in items))
-        # solo has no conflicts -> rides the first wave alongside the hub
-        self.assertIn("solo", out["waves"][0])
-        # no wave contains two items that share a file
+        self.assertIn(["solo"], out["clusters"])   # no conflicts -> cluster of one
+        # two items sharing a file are never in DIFFERENT clusters
         files = {it["name"]: set(it["files"]) for it in items}
-        for wave in out["waves"]:
-            for i in range(len(wave)):
-                for j in range(i + 1, len(wave)):
-                    self.assertFalse(files[wave[i]] & files[wave[j]],
-                                     f"{wave[i]} and {wave[j]} share a file in one wave")
+        where = {n: i for i, c in enumerate(out["clusters"]) for n in c}
+        for a in files:
+            for b in files:
+                if a < b and files[a] & files[b]:
+                    self.assertEqual(where[a], where[b],
+                                     f"{a} and {b} share a file, different clusters")
 
     def test_plan_works_without_graph_and_drops_decided_pairs(self):
         # --graph is optional: clustering/waves/tiers still compute; and a
@@ -205,8 +206,11 @@ class WavesTests(unittest.TestCase):
             {"name": "BE", "files": ["ledger_api.py"]},
             {"name": "FE", "files": ["ledger_ui.tsx"], "after": ["BE"]},
         ]
-        out = fp.plan(items, None, ["ledger"])
-        self.assertEqual(out["waves"], [["BE"], ["FE"]])
+        out = fp.plan(items, None, ["ledger"], trajectories=[])
+        # separate MSPs (no shared file, no contract group), so the chain does
+        # NOT fuse - a cluster cannot span two MSPs. It stays a dispatch edge.
+        self.assertEqual([sorted(c) for c in out["clusters"]], [["BE"], ["FE"]])
+        self.assertEqual(out["cluster_after"], {1: [0]})
         pairs = [set(p["pair"]) for p in out["coupling_review"]]
         self.assertNotIn({"BE", "FE"}, pairs)
 
@@ -237,32 +241,37 @@ class ExecutionCostTests(unittest.TestCase):
         BIG is a fatter single job with nothing behind it. The longer POLE wins,
         and a chain counts its whole remaining depth - so HEAD dispatches first.
         (Were BIG's own cost > the whole chain, BIG would rightly go first.)"""
-        items = [{"name": "BIG", "files": ["b.py"], "cost": 2},
-                 {"name": "HEAD", "files": ["h.py"], "cost": 1},
-                 {"name": "MID", "files": ["m.py"], "after": ["HEAD"]},
-                 {"name": "TAIL", "files": ["t.py"], "after": ["MID"]}]
-        waves = fp.plan(items, None, [])["waves"]
-        self.assertLess(waves[0].index("HEAD"), waves[0].index("BIG"))
+        items = [{"name": "BIG", "files": ["b.py"], "cost": 2, "task": "t"},
+                 {"name": "HEAD", "files": ["h.py"], "cost": 1, "task": "t"},
+                 {"name": "MID", "files": ["m.py"], "after": ["HEAD"], "task": "t"},
+                 {"name": "TAIL", "files": ["t.py"], "after": ["MID"], "task": "t"}]
+        pl = fp.plan(items, None, [], trajectories=[])
+        res = fp.run_plan(pl, items, "true", dry_run=True, branches=False)
+        order = [r["cluster"] for r in res["dispatched"]]
+        self.assertLess(order.index("HEAD"), order.index("BIG"))
 
-    def test_ready_after_is_a_dag_never_a_whole_wave_barrier(self):
+    def test_a_conflict_becomes_one_agent_and_nothing_else_waits(self):
+        """A and B collide, so they are ONE cluster walked by one agent - no
+        waiting involved. SLOW is unrelated and starts immediately."""
         items = [{"name": "A", "files": ["a.py"]},
                  {"name": "SLOW", "files": ["s.py"]},
                  {"name": "B", "files": ["a.py"]}]  # conflicts with A only
-        out = fp.plan(items, None, [])
-        ra = out["ready_after"]
-        self.assertEqual(ra["A"], [])
-        self.assertEqual(ra["SLOW"], [])
-        self.assertEqual(ra["B"], ["A"])       # waits on its conflict...
-        self.assertNotIn("SLOW", ra["B"])      # ...not on the whole wave
+        out = fp.plan(items, None, [], trajectories=[])
+        clusters = [sorted(c) for c in out["clusters"]]
+        self.assertIn(["A", "B"], clusters)
+        self.assertIn(["SLOW"], clusters)
+        self.assertEqual(out["cluster_after"], {})   # nothing waits on anything
 
-    def test_ready_after_honors_declared_producers(self):
+    def test_declared_producers_become_cluster_edges(self):
         items = [{"name": "BE", "files": ["api.py"]},
                  {"name": "FE1", "files": ["a.tsx"], "after": ["BE"]},
                  {"name": "FE2", "files": ["b.tsx"], "after": ["BE"]}]
-        ra = fp.plan(items, None, [])["ready_after"]
-        self.assertEqual(ra["FE1"], ["BE"])
-        self.assertEqual(ra["FE2"], ["BE"])
-        self.assertNotIn("FE1", ra["FE2"])  # two consumers stay parallel
+        out = fp.plan(items, None, [], trajectories=[])
+        clusters, edges = out["clusters"], out["cluster_after"]
+        idx = {c[0]: i for i, c in enumerate(clusters)}
+        self.assertEqual(edges[idx["FE1"]], [idx["BE"]])
+        self.assertEqual(edges[idx["FE2"]], [idx["BE"]])
+        self.assertNotIn(idx["FE1"], edges[idx["FE2"]])  # consumers stay parallel
 
     def test_context_pack_carries_edit_set_and_graph_neighbours(self):
         adj = {"app/svc.py": {"app/models.py"}, "app/models.py": {"app/svc.py"}}
@@ -929,6 +938,43 @@ class BranchPerMSP(unittest.TestCase):
         items = [{"name": "a", "files": ["api/x.py"], "msp": "one"},
                  {"name": "b", "files": ["api/x.py"], "msp": "two"}]
         self.assertEqual(len(fp.msp_items(items)), 1)
+
+
+class TierRouting(unittest.TestCase):
+    """Tiering saves nothing unless the SPAWN COMMAND routes on it."""
+
+    def _items(self):
+        return [{"name": "risky", "files": ["api/auth/x.py"], "task": "t"},
+                {"name": "trivial", "files": ["web/copy.ts"], "task": "t"}]
+
+    def test_model_placeholder_resolves_per_cluster(self):
+        items = self._items()
+        pl = fp.plan(items, None, ["auth"], trajectories=[])
+        res = fp.run_plan(pl, items, "agent --model {model} -p {prompt}",
+                          dry_run=True, branches=False,
+                          tier_models={"top": "opus", "cheap": "sonnet"})
+        got = {r["cluster"]: r["argv"][r["argv"].index("--model") + 1]
+               for r in res["dispatched"]}
+        self.assertEqual(got["risky"], "opus")
+        self.assertEqual(got["trivial"], "sonnet")
+
+    def test_tier_placeholder_is_populated_not_blank(self):
+        items = self._items()
+        pl = fp.plan(items, None, ["auth"], trajectories=[])
+        res = fp.run_plan(pl, items, "agent --tier {tier} -p {prompt}",
+                          dry_run=True, branches=False)
+        tiers = {r["cluster"]: r["argv"][r["argv"].index("--tier") + 1]
+                 for r in res["dispatched"]}
+        self.assertEqual(tiers["risky"], "top")
+        self.assertEqual(tiers["trivial"], "cheap")
+
+    def test_unmapped_tier_leaves_the_model_empty_rather_than_guessing(self):
+        items = self._items()
+        pl = fp.plan(items, None, ["auth"], trajectories=[])
+        res = fp.run_plan(pl, items, "agent --model {model}", dry_run=True,
+                          branches=False, tier_models={"top": "opus"})
+        blank = [r for r in res["dispatched"] if r["cluster"] == "trivial"]
+        self.assertEqual(blank[0]["argv"][-1], "")
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,10 +25,11 @@ stale; blind to the cross-repo API contract. The orchestrator still reviews
 diffs AND renders the coupling_review verdicts.
 
 Execution-cost outputs (all ADDITIVE - clustering and merge safety are unchanged):
-ready_after: per item, the predecessors that must INTEGRATE before it starts, so
-a consumer can PIPELINE (start each item when ITS deps land) instead of marching
-whole-wave barriers - wall-clock tracks the critical path, not the sum of
-per-wave slowest items. waves stays for consumers that want the simple shape.
+Ordering is INTERNAL. `global_waves` and `ready_after` still compute the
+makespan-aware sequence, because that is what orders the leaves inside a
+cluster - but neither is emitted. A barrier schedule is not something a
+consumer should dispatch off: it makes an item wait on unrelated slow
+neighbours, where `cluster_after` makes it wait only on its actual predecessor.
 context_packs: per item, the files to read (its own + graph neighbours), so an
 agent does not spend its tokens LOCATING the work. shared_context: files >1 item
 in a wave would each read separately. coalesce: small cheap-tier items one agent
@@ -794,8 +795,6 @@ def plan(items, graph_path, risk_markers, trajectories=None,
         "msps": msps,
         "clusters": clusters,
         "cluster_after": cluster_after(items, clusters),
-        "waves": waves,
-        "ready_after": deps,
         "coupling_review": review,
         "tier": tier,
         "verify_mode": verify_modes(items, serial_verify_markers or []),
@@ -1297,20 +1296,27 @@ def render_cluster_prompt(members, by_name, packs, tier, order,
     return "\n".join(lines)
 
 
-def build_argv(exec_template, prompt, item, tier="", cluster="", msp=""):
+def build_argv(exec_template, prompt, item, tier="", cluster="", msp="",
+               model=""):
     """argv WITHOUT a shell: split the template FIRST, then substitute into the
     resulting tokens, so a prompt containing quotes, newlines, backticks or
     semicolons lands as ONE argument and can never be re-read as shell syntax.
 
-    `{tier}` is here so the SPAWN COMMAND can act on the tier, not just mention it
-    in the prompt. Tiering only saves anything if something routes on it, and the
-    routing knob is the command line - `agent --model {tier} -p {prompt}`. Without
-    this the tier reached the agent as text it could read about itself and not act
-    on, so every cluster ran on one model whatever the plan said."""
+    `{tier}` and `{model}` exist so the SPAWN COMMAND can ACT on the tier rather
+    than merely mention it. Tiering saves nothing unless something routes on it,
+    and the routing knob is the command line. `{tier}` substitutes `top`/`cheap`,
+    which are not model names - `{model}` substitutes whatever `--tier-models`
+    maps that tier to, which is the usable one:
+
+        --exec 'agent --model {model} -p {prompt}' --tier-models top=opus,cheap=sonnet
+
+    Without this every cluster ran on one model whatever the plan said, and the
+    tier was text the agent could read about itself and not act on."""
     return [tok.replace("{prompt}", prompt)
                .replace("{name}", item["name"])
                .replace("{files}", ",".join(item.get("files", [])))
                .replace("{tier}", tier)
+               .replace("{model}", model)
                .replace("{cluster}", str(cluster))
                .replace("{msp}", str(msp))
             for tok in shlex.split(exec_template)]
@@ -1348,7 +1354,7 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
              prompt_template=None, cwd=None, poll=0.2, run_dir=None,
              resume=False, max_output=4000, contract=RETURN_CONTRACT,
              base=None, worktree_root=None, pr_template=None,
-             push_remote="origin", branches=True):
+             push_remote="origin", branches=True, tier_models=None):
     """Dispatch ONE AGENT PER CLUSTER, unlocking dependents as each finishes.
 
     The cluster is the unit of work: an agent owns its leaves and walks them in
@@ -1495,7 +1501,8 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
                 prompt_template, contract)
             head = by_name.get(members[0], {"name": members[0], "files": []})
             argv = build_argv(exec_template, prompt, head, tier=cluster_tier(nxt),
-                              cluster=label(nxt), msp=cluster_msp.get(nxt, ""))
+                              cluster=label(nxt), msp=cluster_msp.get(nxt, ""),
+                              model=(tier_models or {}).get(cluster_tier(nxt), ""))
             if dry_run:
                 status[nxt] = "ok"
                 records.append({"item": label(nxt), "cluster": label(nxt),
@@ -1631,6 +1638,13 @@ def main():
                     help="escape hatch: run every cluster in ONE working tree "
                          "with no branches and no PRs. Only for a scratch repo "
                          "or a non-git directory.")
+    ap.add_argument("--tier-models", default="",
+                    help="map each tier to a model, e.g. "
+                         "'top=opus,cheap=sonnet'. Substituted into --exec as "
+                         "{model}. Without it every cluster runs on whatever "
+                         "model your agent defaults to, and the tiering saves "
+                         "nothing - the plan says which work is cheap, but "
+                         "nothing routes on it.")
     ap.add_argument("--concurrency", type=int, default=4,
                     help="most items dispatched at once (default 4)")
     ap.add_argument("--dry-run", action="store_true",
@@ -1705,6 +1719,23 @@ def main():
     if not args.exec_template:
         print(json.dumps(computed, indent=2))
         return
+    tier_models = {}
+    for pair in (p for p in args.tier_models.split(",") if p.strip()):
+        if "=" not in pair:
+            ap.error("--tier-models wants tier=model pairs, e.g. "
+                     "'top=opus,cheap=sonnet' (got %r)" % pair)
+        k, v = pair.split("=", 1)
+        tier_models[k.strip()] = v.strip()
+    # A {model} template with an unmapped tier would silently run that cluster
+    # on the agent's default - the exact failure tiering exists to prevent. Say
+    # so instead.
+    if args.exec_template and "{model}" in args.exec_template:
+        used = {b["tier"] for b in computed.get("cluster_briefs", [])} or \
+               set(computed.get("tier", {}).values())
+        missing = sorted(used - set(tier_models))
+        if missing:
+            ap.error("--exec uses {model} but --tier-models has no entry for: %s"
+                     % ", ".join(missing))
     run_dir = None
     if not args.no_run_dir and not args.dry_run:
         run_dir = args.run_dir or os.path.join(
@@ -1716,7 +1747,7 @@ def main():
                       base=args.base, worktree_root=args.worktree_root,
                       pr_template=args.pr_template,
                       push_remote=None if args.no_push else "origin",
-                      branches=not args.no_branches)
+                      branches=not args.no_branches, tier_models=tier_models)
     if args.run_log:
         with open(args.run_log, "w", encoding="utf-8") as f:
             for record in result["dispatched"]:
