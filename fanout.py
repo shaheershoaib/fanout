@@ -764,6 +764,14 @@ def plan(items, graph_path, risk_markers, trajectories=None,
          coalesce_below=2.0, coalesce_max=4, briefs=True):
     """graph_path is OPTIONAL (None -> no import-adjacency signals; clustering,
     waves, tiers, and the marker/history coupling signals still compute)."""
+    seen_names, dupes = set(), set()
+    for it in items:
+        (dupes if it["name"] in seen_names else seen_names).add(it["name"])
+    if dupes:
+        # Every structure downstream is keyed by name - tiers, packs, state,
+        # worktree labels. Two leaves sharing one would silently merge into
+        # whichever was written last.
+        raise ValueError("duplicate item name(s): %s" % ", ".join(sorted(dupes)))
     if graph_path:
         nodes, links = load_graph(graph_path)
         adj = build_file_coupling(nodes, links)
@@ -848,6 +856,14 @@ def plan(items, graph_path, risk_markers, trajectories=None,
                   if not (it.get("task") or it.get("text")))
     if thin:
         result["underspecified"] = thin
+
+    # An item with NO predicted files collides with nothing, so it looks safely
+    # parallel with everything - which is exactly what an item recon failed on
+    # looks like too. The plan cannot tell those apart, so it says so rather
+    # than quietly treating a failure as a green light.
+    blind = sorted(it["name"] for it in items if not it.get("files"))
+    if blind:
+        result["unpredicted"] = blind
     result["plan_id"] = plan_id(result)
     return result
 
@@ -1153,6 +1169,19 @@ def run_recon(asks, exec_template, concurrency=4, cwd=None, poll=0.2,
             time.sleep(poll)
     if scratch:
         shutil.rmtree(scratch, ignore_errors=True)
+
+    # Recon workers run one per ask and cannot see each other's leaf names, so an
+    # `after` naming another ask's work is a GUESS. A bad guess must not abort the
+    # batch - dropping the edge costs parallelism on one item; raising costs every
+    # PR in the run. Report each drop; a silent one would look like a plan.
+    known = {i["name"] for i in items}
+    for it in items:
+        bad = [d for d in (it.get("after") or []) if d not in known]
+        if bad:
+            it["after"] = [d for d in it["after"] if d in known]
+            report.append({"item": it["name"], "dropped_after": bad,
+                           "error": "recon named producers that do not exist in "
+                                    "this work-set; the edges were dropped"})
     return items, report
 
 

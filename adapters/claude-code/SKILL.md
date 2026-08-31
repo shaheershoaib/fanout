@@ -185,6 +185,9 @@ Output JSON:
   converges into one branch and cannot span two. Independent items come out as
   clusters of one, which is the common case and the best one.
   **BREAKING: `clusters` used to mean what `msps` now means.**
+- `unpredicted`: leaves recon returned NO files for. They collide with nothing,
+  so they look safely parallel with everything - which is also exactly what a
+  recon failure looks like. The plan cannot tell those apart; you can.
 - `cluster_briefs`: **what each subagent must be told.** One entry per cluster:
   its `leaves`, the `msp` it belongs to, its `tier`, the clusters it waits on,
   and a ready-to-send `prompt`. `--exec` sends exactly this, so an orchestrator
