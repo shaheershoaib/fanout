@@ -32,7 +32,7 @@ The word **cluster moves down one level.**
 | v2 term     | today       | meaning                                          |
 |-------------|-------------|--------------------------------------------------|
 | **MSP**     | `cluster`   | top unit. One MSP = one branch = one PR.         |
-| **cluster** | *(none)*    | a parallelizable unit *inside* an MSP.           |
+| **cluster** | *(none)*    | a dependency chain *inside* an MSP; one owner.   |
 
 So `cluster_items()` must be renamed `msp_items()`. Without that rename the code
 returns the opposite of what this spec says.
@@ -56,8 +56,8 @@ own PR and invites a partial merge.
 flowchart TB
   A["plain text asks"] --> R["<b>recon</b><br/>graphify → grep → structural<br/><i>one ask may split into several items</i>"]
   R --> G["<b>group into MSPs</b><br/>shared file or contract_group<br/>+ shippability test"]
-  G --> W["<b>schedule MSPs</b><br/>waves · ready_after"]
-  W --> S["<b>split each MSP into clusters</b><br/><i>contract pinned → parallel<br/>unpinned → one owner</i>"]
+  G --> W["<b>order</b><br/>ready_after DAG<br/><i>no barriers</i>"]
+  W --> S["<b>split each MSP into clusters</b><br/><i>a cluster is a dependency CHAIN,<br/>one owner, sequential inside</i>"]
   S --> T["<b>tier</b><br/>blast radius × complexity"]
   T --> D["<b>dispatch</b><br/>one process per cluster"]
   D --> B["clusters converge<br/>into ONE branch per MSP"]
@@ -93,11 +93,12 @@ overlap, so files must exist before grouping can happen.
    that grouping would otherwise never see.
 3. **Group into MSPs** — union items sharing an edited file or a
    `contract_group`, then apply the shippability test above.
-4. **Schedule MSPs** — global waves + `ready_after`. `design`-type items are
-   wave-0 producers; their implementations declare `after`.
-5. **Split each MSP into clusters** — the MSP's subgraph gives its internal
-   parallelism, **subject to the contract rule below**. An MSP with no internal
-   disjointness is a single cluster.
+4. **Order** — `ready_after` only. Each item starts when *its own* predecessors
+   land. No barriers (see "No waves" below).
+5. **Split each MSP into clusters** — a cluster is a **dependency chain**: one
+   owner, sequential inside, parallel across clusters. The MSP's subgraph gives
+   the disjointness, **subject to the contract rule below**. An MSP with no
+   internal disjointness is a single cluster.
 6. **Tier** — per cluster, from blast radius *and* complexity (see below).
 7. **Dispatch** — one process per cluster along the DAG. All clusters of one MSP
    converge into that MSP's single branch.
@@ -116,8 +117,8 @@ The rule has two branches:
 
 - **Contract not pinned → serialize.** The group is one cluster, one owner. This
   is today's behaviour and stays the default.
-- **Contract pinned → parallel.** Emit the interface as a **wave-0 producer
-  cluster**; the halves declare `after` it and then run concurrently against a
+- **Contract pinned → parallel.** The interface becomes the **head of the
+  chain**; the halves declare `after` it and then run concurrently against a
   fixed shape.
 
 Pinning is what real teams do — agree the interface, then build both sides at
@@ -149,6 +150,31 @@ a rebuild and a wrong top-tier call costs tokens.
 
 Fanout still emits `top` / `cheap`, never a model name. Which model each tier
 maps to is the caller's, and model names change faster than this tool should.
+
+## No waves
+
+`waves` is a barrier schedule: everything in wave N runs, then everything
+waits, then wave N+1 starts. fanout's own docstring already calls it the lesser
+shape — `ready_after` exists "so a consumer can PIPELINE (start each item when
+ITS deps land) instead of marching whole-wave barriers - wall-clock tracks the
+critical path, not the sum of per-wave slowest items."
+
+v2 drops barriers from the model entirely. Two rules replace them:
+
+- **A dependency chain is one cluster, owned by one agent.** The agent that
+  built the producer already holds the context for its consumer; handing that
+  to a fresh agent after a barrier pays the context load twice and loses what
+  it learned. It finishes one leaf and moves to the next itself.
+- **Across clusters, `ready_after` governs.** A cluster starts when its own
+  predecessors land, never when an unrelated slow neighbour finishes.
+
+The one shape a chain cannot express is a **diamond** — two producers feeding
+one consumer. That consumer belongs to neither chain exclusively, so
+`ready_after` remains the general form and chains are the common case it
+collapses to.
+
+`waves` may stay in the output for backward compatibility, but nothing in v2
+should schedule off it.
 
 ## Item schema
 
