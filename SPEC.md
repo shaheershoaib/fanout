@@ -103,6 +103,13 @@ split.
    inside, and independent of every other cluster by construction, **subject to
    the contract rule below**. An MSP with no internal disjointness is a single
    cluster; an item with no dependencies is a cluster of one.
+
+   **All-independent leaves is the best case** — every leaf its own cluster,
+   every cluster parallel. So recon should prefer a split whose leaves do not
+   depend on each other. It must never buy that by *pretending*: two coupled
+   leaves declared independent is the contract-divergence failure with extra
+   steps. A dependency recon can see belongs in the graph, where it costs one
+   sequential step inside a cluster instead of a wrong build.
 5. **Tier** — per cluster, from blast radius *and* complexity (see below).
 6. **Dispatch** — one process per cluster, all at once; nothing waits. All
    clusters of one MSP converge into that MSP's single branch.
