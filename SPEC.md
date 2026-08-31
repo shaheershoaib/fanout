@@ -111,10 +111,10 @@ split.
    steps. A dependency recon can see belongs in the graph, where it costs one
    sequential step inside a cluster instead of a wrong build.
 5. **Tier** — per cluster, from blast radius *and* complexity (see below).
-6. **Dispatch** — one process per cluster. An MSP's clusters all start at once
-   and converge into that MSP's single branch. An MSP with an `after` edge
-   starts when its producer's build completes, branching off the producer's
-   branch.
+6. **Dispatch** — one process per cluster. Every cluster without an `after`
+   edge starts immediately, whatever MSP it belongs to. A cluster with an edge
+   starts once its producer's build has completed. All of an MSP's clusters
+   converge into that MSP's single branch.
 7. **PR** — when an MSP completes, open a draft PR for its branch.
 8. **Reconcile** — compare each cluster's returned `files_changed` against what
    recon predicted.
@@ -148,13 +148,26 @@ What B needs from A decides the shape:
 **B needs A's interface only.** Nothing is ordered. Pin the contract and build
 both halves in parallel inside one MSP — the contract rule above.
 
-**B needs A's code to exist.** B declares `after: [A]` and dispatches when A's
-last cluster returns. "Done" means **A's build completed**, not A merged — A's
-branch already holds the code, so B branches off A's branch and its PR stacks on
-A's. No merge is required mid-run.
+**B needs A's code to exist.** The edge belongs on the **cluster that actually
+needs it**, never on the whole MSP. If one of B's five leaves depends on A, that
+leaf's cluster carries `after: [A]` and B's other four clusters start at t=0.
+An MSP-level `after` is a derived fact — the union of its clusters' edges — and
+never a dispatch gate. Gating all of B on A is a barrier at MSP scope, which is
+the same error waves made one level up.
+
+"Done" means **A's build completed**, not A merged — A's branch already holds
+the code, so no merge is required mid-run. B's PR is still gated on A, since it
+opens only once every B cluster has returned; B's *work* is not.
+
+The branch mechanics are the one part that is not free. B's independent clusters
+run on B's branch off the integration ref, while the dependent cluster needs A's
+code, so B's branch must rebase onto A's branch before that cluster runs — and
+rebasing under running agents invites corruption. **Run the dependent cluster
+last:** wait for A's build *and* B's independent clusters, rebase, then dispatch
+it. B's PR then stacks on A's.
 
 - The stacking risk is real and worth stating: if A's PR changes in review, B
-  rebases. That is the cost of pipelining instead of waiting for a human.
+  rebases again. That is the cost of pipelining instead of waiting for a human.
 - **Fusing stays available** when the two are small enough that one PR is the
   better unit — the dependency then becomes an edge inside a cluster and one
   agent walks it. Prefer fusing only when the fused diff is still reviewable
@@ -209,9 +222,9 @@ Inside an MSP there are no edges left to wait on at all. Because a cluster is a
 *inside* some cluster, so all of an MSP's clusters start at once and the MSP is
 done when the last returns.
 
-Between MSPs, a real dependency stays an edge: B dispatches when A's build
-completes, and nothing else in the batch waits with it (see "Cross-MSP
-dependencies").
+Between MSPs, a real dependency stays an edge — and it is carried by the single
+cluster that needs it, not by the MSP. Every other cluster in that MSP starts
+immediately (see "Cross-MSP dependencies").
 
 **The cost, stated plainly.** A diamond — `A→B`, `A→C`, `B+C→D` — falls entirely
 into one component, so one agent walks it sequentially and the `B`/`C`
@@ -229,8 +242,9 @@ and fanout does not merge.
   and no reason to want. Nothing emits it, nothing reads it.
 - **`ready_after` survives, at two granularities.** Inside a cluster it is the
   sequence handed to the owning agent, so it knows which leaf to build first.
-  Between MSPs it is the dispatch edge — B starts when A's build completes.
-  Within an MSP it is always empty, because those edges live inside clusters.
+  Across MSPs it is the dispatch edge, carried per CLUSTER — the cluster that
+  needs A waits, its siblings do not. Within an MSP it is always empty, because
+  those edges live inside clusters.
 
 So ordering exists exactly where a real dependency exists, and nowhere else.
 
