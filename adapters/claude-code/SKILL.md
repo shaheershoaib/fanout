@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: Use whenever 2+ work-items are on the table in one session - a board with several Open tickets, a multi-finding fix wave, several asks in one or successive user messages - BEFORE starting any of them, and AGAIN when new items arrive mid-session (re-batch; do not queue new asks behind the current item). Not just for when a fan-out is already decided - this tool is HOW you decide: it computes the MSPs (one MSP = one branch = one PR), splits each into clusters (the unit one agent owns and walks sequentially), carries dependency edges at cluster granularity so one blocked leaf never gates its siblings, and tiers each cluster by blast radius x complexity. Runs standalone - stdlib only, no git, no network. Orchestrators consume the plan (in this environment, `ship` at step 0 and `proto-port` at its plan step). The project supplies the risk-marker taxonomy and any graph path; this tool bakes in no project paths.
+description: Use whenever 2+ work-items are on the table in one session - a board with several Open tickets, a multi-finding fix wave, several asks in one or successive user messages - BEFORE starting any of them, and AGAIN when new items arrive mid-session (re-batch; do not queue new asks behind the current item). Not just for when a fan-out is already decided - this tool is HOW you decide: it computes the MSPs (one MSP = one branch = one PR), splits each into clusters (the unit one agent owns and walks sequentially), carries dependency edges at cluster granularity so one blocked leaf never gates its siblings, and tiers each cluster by blast radius x complexity. Runs standalone - Python stdlib only, no packages to install. Planning is pure (JSON in, JSON out); `--exec` additionally drives git and `gh` to carry each MSP to a draft PR. Orchestrators consume the plan (in this environment, `ship` at step 0 and `proto-port` at its plan step). The project supplies the risk-marker taxonomy and any graph path; this tool bakes in no project paths.
 ---
 
 # fanout
@@ -9,11 +9,17 @@ Turn "fan out only on disjoint files" from manual judgment into a computed plan 
 and, with `--exec`, into the dispatch itself.
 
 **Boundary: fanout schedules and (optionally) dispatches; the CONSUMER owns the job.**
-It plans in seconds, deterministically, and touches no git and ships nothing. With
-`--exec` it will spawn one process per item along the dependency DAG, but it still
-never commits, merges, gates or closes anything - the gated spine, verification and
-close-outs stay with the CONSUMER - whatever loop you run (here, `ship` for work-sets
-and `proto-port` for ports).
+Planning alone touches no git: `fanout.py --items ...` prints JSON and stops. With
+`--exec` it goes further and carries each MSP to a DRAFT PR - one worktree and branch
+per MSP off `base`, one agent per cluster, then commit, push, and `gh pr create --draft`
+once every cluster in that MSP succeeds (a failed cluster blocks its MSP, so a
+half-built MSP never reaches this).
+
+**It stops at the open draft PR.** It never gates, never verifies, never marks a PR
+ready, never merges, and never closes a ticket - that is where the CONSUMER takes over
+(here, `ship` for work-sets and `proto-port` for ports). The line is not "planner vs
+executor"; it is that fanout produces reviewable branches and something else decides
+whether they are correct.
 Use `--exec` when you want the plan EXECUTED rather than followed by hand; leave it
 off when the consumer is doing its own dispatching.
 
