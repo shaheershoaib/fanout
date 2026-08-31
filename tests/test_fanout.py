@@ -630,5 +630,82 @@ class MarkerMatching(unittest.TestCase):
         self.assertEqual(fp.tier_for(["app/types/AuthResponse.ts"], ["auth"]),
                          "top")
 
+
+class ClusterDispatch(unittest.TestCase):
+    """One agent per cluster; dependents unlock as producers finish."""
+
+    def _plan(self, items):
+        return fp.plan(items, None, [], trajectories=[])
+
+    def test_one_dispatch_per_cluster_not_per_item(self):
+        items = [{"name": "a", "files": ["x.py"], "task": "do a"},
+                 {"name": "b", "files": ["x.py"], "task": "do b"},
+                 {"name": "c", "files": ["y.py"], "task": "do c"}]
+        pl = self._plan(items)
+        res = fp.run_plan(pl, items, "true", dry_run=True)
+        self.assertEqual(len(res["dispatched"]), 2)   # a+b share x.py -> one agent
+
+    def test_cluster_prompt_lists_every_leaf_with_its_files(self):
+        items = [{"name": "a", "files": ["x.py"], "task": "do a"},
+                 {"name": "b", "files": ["x.py"], "task": "do b"}]
+        pl = self._plan(items)
+        prompt = fp.render_cluster_prompt(
+            pl["clusters"][0], {i["name"]: i for i in items},
+            pl["context_packs"], "cheap", [], None, fp.RETURN_CONTRACT)
+        self.assertIn("do a", prompt)
+        self.assertIn("do b", prompt)
+        self.assertIn("x.py", prompt)
+        self.assertIn("ORDER", prompt)          # multi-leaf ordering instruction
+
+    def test_file_notes_reach_the_agent(self):
+        items = [{"name": "a", "files": ["x.py", "y.py"], "task": "do a",
+                  "file_notes": {"x.py": "add the endpoint", "z.py": "not mine"}}]
+        prompt = fp.render_cluster_prompt(
+            ["a"], {i["name"]: i for i in items}, {}, "cheap", [], None, None)
+        self.assertIn("add the endpoint", prompt)
+        self.assertNotIn("not mine", prompt)     # notes outside `edit` are dropped
+
+    def test_dependent_cluster_waits_and_siblings_do_not(self):
+        items = [{"name": "a", "files": ["a.py"], "task": "t"},
+                 {"name": "b", "files": ["b.py"], "task": "t", "after": ["a"]},
+                 {"name": "free", "files": ["c.py"], "task": "t"}]
+        pl = self._plan(items)
+        res = fp.run_plan(pl, items, "true", dry_run=True)
+        order = [r["cluster"] for r in res["dispatched"]]
+        self.assertLess(order.index("a"), order.index("b"))
+        self.assertEqual(len(order), 3)
+
+    def test_failed_cluster_blocks_only_its_dependents(self):
+        items = [{"name": "a", "files": ["a.py"], "task": "t"},
+                 {"name": "b", "files": ["b.py"], "task": "t", "after": ["a"]},
+                 {"name": "free", "files": ["c.py"], "task": "t"}]
+        pl = self._plan(items)
+        res = fp.run_plan(pl, items, "false")     # every worker exits non-zero
+        by = {r["cluster"]: r for r in res["dispatched"]}
+        self.assertEqual(by["a"]["status"], "failed")
+        self.assertEqual(by["b"]["status"], "blocked")
+        self.assertEqual(by["free"]["status"], "failed")   # ran, did not wait
+
+    def test_cluster_tier_is_the_riskiest_leaf(self):
+        """One agent does every leaf in the cluster, so the cluster runs at the
+        tier of its riskiest member - not the average, and not the first."""
+        items = [{"name": "safe", "files": ["copy.ts"], "task": "t"},
+                 {"name": "risky", "files": ["copy.ts", "api/auth/x.py"],
+                  "task": "t"}]
+        pl = fp.plan(items, None, ["auth"], trajectories=[])
+        self.assertEqual(pl["tier"]["safe"], "cheap")
+        res = fp.run_plan(pl, items, "true", dry_run=True)
+        self.assertEqual(len(res["dispatched"]), 1)
+        self.assertEqual(res["dispatched"][0]["tier"], "top")
+
+    def test_underspecified_items_are_named(self):
+        items = [{"name": "a", "files": ["x.py"]},
+                 {"name": "b", "files": ["y.py"], "task": "do b"}]
+        pl = self._plan(items)
+        self.assertEqual(pl["underspecified"], ["a"])
+
+    def test_multi_leaf_returns_are_all_kept(self):
+        self.assertEqual(len(fp.parse_returns('{"a":1}\nnoise\n{"b":2}')), 2)
+
 if __name__ == "__main__":
     unittest.main()
