@@ -976,5 +976,33 @@ class TierRouting(unittest.TestCase):
         blank = [r for r in res["dispatched"] if r["cluster"] == "trivial"]
         self.assertEqual(blank[0]["argv"][-1], "")
 
+
+class BriefParity(unittest.TestCase):
+    """Every dispatch path must send the SAME brief. If they can differ, the
+    hand-dispatched agents are the ones told less, and nobody finds out."""
+
+    ITEMS = [{"name": "A", "files": ["f1.py"], "task": "do A"},
+             {"name": "B", "files": ["f1.py", "f2.py"], "task": "do B"},
+             {"name": "C", "files": ["f2.py"], "task": "do C"}]
+
+    def test_clusters_carry_their_own_walk_order(self):
+        pl = fp.plan(self.ITEMS, None, [], trajectories=[])
+        self.assertEqual(pl["clusters"], [["B", "A", "C"]])   # hub first
+
+    def test_exec_matches_the_brief_with_and_without_briefs_emitted(self):
+        with_b = fp.plan(self.ITEMS, None, [], trajectories=[])
+        without = fp.plan(self.ITEMS, None, [], trajectories=[], briefs=False)
+        a = fp.run_plan(with_b, self.ITEMS, "x {prompt}", dry_run=True,
+                        branches=False)["dispatched"][0]["argv"][-1]
+        b = fp.run_plan(without, self.ITEMS, "x {prompt}", dry_run=True,
+                        branches=False)["dispatched"][0]["argv"][-1]
+        self.assertEqual(a, with_b["cluster_briefs"][0]["prompt"])
+        self.assertEqual(a, b)
+
+    def test_leaf_order_survives_into_the_prompt(self):
+        pl = fp.plan(self.ITEMS, None, [], trajectories=[])
+        prompt = pl["cluster_briefs"][0]["prompt"]
+        self.assertLess(prompt.index('"B"'), prompt.index('"A"'))
+
 if __name__ == "__main__":
     unittest.main()

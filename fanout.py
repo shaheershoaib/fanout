@@ -790,7 +790,12 @@ def plan(items, graph_path, risk_markers, trajectories=None,
     packs = context_packs(items, adj, context_hops, context_cap)
     deps = ready_after(items, waves)
     msps = msp_items(items)
-    clusters = cluster_items(items)
+    # Each cluster's members are stored in the order its agent must walk them.
+    # Carrying the order IN the cluster is what stops a second consumer having
+    # to re-derive it from a schedule - and the schedule is not emitted.
+    seq = {n: i for i, n in enumerate(n for w in waves for n in w)}
+    clusters = [sorted(c, key=lambda n: seq.get(n, len(seq)))
+                for c in cluster_items(items)]
     result = {
         "msps": msps,
         "clusters": clusters,
@@ -1380,7 +1385,8 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
              for k, vs in (plan_obj.get("cluster_after") or {}).items()}
     packs, tier = plan_obj.get("context_packs", {}), plan_obj.get("tier", {})
     within = plan_obj.get("ready_after", {})
-    order = [n for w in plan_obj.get("waves", []) for n in w]
+    # clusters arrive already ordered, so there is no schedule to consult
+    order = []
     pid = plan_obj.get("plan_id") or plan_id(plan_obj)
 
     def label(i):
