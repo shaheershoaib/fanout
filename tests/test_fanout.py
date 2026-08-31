@@ -1129,5 +1129,38 @@ class ReconOutputIsUntrusted(unittest.TestCase):
                      {"name": "b", "files": ["y.py"], "after": ["a"]}],
                     None, [], trajectories=[])
 
+
+class ReconcileRunsAutomatically(unittest.TestCase):
+    """The prediction check has to happen without being asked, or the promise
+    that you are told when recon was wrong only holds for someone who already
+    suspected it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.worker = os.path.join(self.tmp, "w.py")
+        open(self.worker, "w").write(
+            "import os, json\n"
+            "c = os.environ['FANOUT_CLUSTER']\n"
+            "mine = [f for f in os.environ.get('FANOUT_FILES','').split(',') if f]\n"
+            "touched = mine + (['b/f.py'] if c == 'one' else [])\n"
+            "print(json.dumps({'item': c, 'status':'ok',"
+            " 'files_changed': touched, 'notes':'d'}))\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_run_reports_reconcile_without_being_asked(self):
+        items = [{"name": "one", "files": ["a/f.py"], "task": "t"},
+                 {"name": "two", "files": ["b/f.py"], "task": "t"}]
+        pl = fp.plan(items, None, [], trajectories=[])
+        res = fp.run_plan(pl, items, "%s %s" % (sys.executable, self.worker),
+                          run_dir=os.path.join(self.tmp, "rd"), branches=False,
+                          push_remote=None)
+        rc = res["reconcile"]
+        self.assertFalse(rc["clean"])
+        self.assertEqual(rc["collisions"], 1)
+        hit = [f for f in rc["findings"] if f["severity"] == "collision"][0]
+        self.assertEqual((hit["item"], hit["file"]), ("one", "b/f.py"))
+
 if __name__ == "__main__":
     unittest.main()

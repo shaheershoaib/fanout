@@ -183,8 +183,10 @@ judgement, not a fact — and an under-predicted file list is the one error that
 breaks a plan rather than slowing it.
 
 So the guarantee is conditional and says so: **the plan is safe if recon was
-right, and you are told when it was not.** After a run, `reconcile()` compares
-predicted files against what each cluster actually changed. A surprise inside an
+right, and you are told when it was not.** Every run reconciles automatically —
+no flag, nothing to remember — comparing predicted files against what each
+cluster reported changing, and a cross-MSP collision exits non-zero even when
+every cluster succeeded. A surprise inside an
 MSP is noise; one that lands in another MSP's files means those two were not
 disjoint and the plan ran a real collision in parallel.
 
