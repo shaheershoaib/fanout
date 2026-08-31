@@ -17,6 +17,22 @@ Use `--exec` when you want the plan EXECUTED rather than followed by hand; leave
 off when the consumer is doing its own dispatching.
 
 ## Use it
+
+**From plain asks (fanout does the recon):**
+
+`python3 ~/.claude/skills/fanout/fanout.py --asks <asks.txt> --recon-exec 'claude -p {prompt}' [--graph <graph.json>] --emit-items items.json --risk-markers <a,b,c>`
+
+One ask per line. Fanout runs one recon worker per ask, in parallel, and each
+returns the leaves that ask decomposes into - with a `task`, the files it will
+edit, `file_notes`, a `complexity` and an `acceptance` line. Recon resolves
+files in this order: **the graphify graph if `--graph` names one** (it is told
+the path and told to query it first), then grep for the named surface, then -
+for net-new work with nothing to grep - the directory structure. `--emit-items`
+writes the derived items so they can be read and corrected before anything is
+built.
+
+**From items you already have:**
+
 `python3 ~/.claude/skills/fanout/fanout.py --items <items.json> [--graph <graph.json>] --risk-markers <a,b,c> [--serial-verify-markers <d,e>] [--trajectories <store.jsonl> | --no-trajectories]`
 
 Each item may carry an optional `complexity` (`simple` | `complex`) and `type`
@@ -149,6 +165,11 @@ Output JSON:
   converges into one branch and cannot span two. Independent items come out as
   clusters of one, which is the common case and the best one.
   **BREAKING: `clusters` used to mean what `msps` now means.**
+- `cluster_briefs`: **what each subagent must be told.** One entry per cluster:
+  its `leaves`, the `msp` it belongs to, its `tier`, the clusters it waits on,
+  and a ready-to-send `prompt`. `--exec` sends exactly this, so an orchestrator
+  spawning its OWN subagents sends the same thing rather than reconstructing it
+  and telling them less.
 - `cluster_after`: cluster index -> the clusters whose build must finish first.
   Carried by the CLUSTER that needs it, never by its MSP: if one of B's five
   leaves depends on A, that leaf's cluster waits and B's other four start at

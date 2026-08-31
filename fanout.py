@@ -44,7 +44,9 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import tempfile
 import time
 from collections import defaultdict
 
@@ -803,6 +805,32 @@ def plan(items, graph_path, risk_markers, trajectories=None,
                                                     deps))):
         if value:  # omit empty sections rather than pad the plan
             result[key] = value
+    # The brief for every cluster, in the plan itself. --exec is only ONE of the
+    # two consumers: an orchestrator that spawns its own subagents needs the
+    # same thing, and if it has to reconstruct it, the two paths drift and the
+    # hand-dispatched agents are the ones told less.
+    by_name = {it["name"]: it for it in items}
+    msp_index = {}
+    for i, group in enumerate(msps):
+        for n in group:
+            msp_index[n] = i
+    order = [n for w in waves for n in w]
+    edges = result["cluster_after"]
+    briefs = []
+    for i, members in enumerate(clusters):
+        ctier = "top" if any(tier.get(n) == "top" for n in members) else "cheap"
+        briefs.append({
+            "cluster": i,
+            "label": members[0] if len(members) == 1 else "cluster-%d" % i,
+            "msp": msp_index.get(members[0]),
+            "leaves": members,
+            "tier": ctier,
+            "after_clusters": edges.get(i, []),
+            "prompt": render_cluster_prompt(members, by_name, packs, ctier,
+                                            order, None, RETURN_CONTRACT),
+        })
+    result["cluster_briefs"] = briefs
+
     # An item with no `task` dispatches an agent whose entire brief is a NAME.
     # That is a plan defect, and a silent one - the run looks normal and the
     # work is guesswork. Name them so the caller fixes the items, not the plan.
@@ -960,6 +988,158 @@ def parse_returns(text):
     return out
 
 
+RECON_CONTRACT = """You are doing RECON for a parallel build planner. You write NO code.
+
+Read the request below and return the work-items it decomposes into. Return ONE
+line of JSON and nothing after it:
+
+{"items":[{ ... }, ...]}
+
+Each item is one LEAF - the smallest piece one agent can build in one sitting:
+
+  name            short kebab-case id, unique
+  task            what to DO, specific enough for an agent with NO other
+                  context to act on. This is the entire brief it will get.
+  files           every file the work will EDIT. Include central registries a
+                  new feature must touch - router, DI container, index barrel,
+                  migrations dir - which nothing in the request will mention.
+  file_notes      {path: what changes in that file}, for each file above
+  type            fix | feature | port | design | sweep | contract
+  complexity      simple  (mechanical, fully specified)
+                | complex (needs judgement, unfamiliar, or easy to get wrong)
+  acceptance      one observable that proves it works
+  after           names of items that must be BUILT first (optional)
+  contract_group  shared id for two halves of one interface (optional)
+
+Rules that decide the plan, so get them right:
+
+- SPLIT the request into independent leaves wherever you honestly can - leaves
+  that do not depend on each other run in parallel. Never fake independence: a
+  dependency you can see belongs in `after`, where it costs one sequential step
+  instead of a wrong build.
+- `files` is what merge safety is computed from. Two leaves that edit one file
+  are forced to one agent, so an under-predicted list is the one error that
+  breaks the plan rather than slowing it.
+- Two halves of one interface (an endpoint and its caller) share a
+  `contract_group`. If you also emit a `type: contract` leaf they both declare
+  `after`, they build in PARALLEL against a pinned shape; without it they are
+  serialized under one agent.
+
+HOW TO FIND THE FILES - in this order, and stop at the first that answers:
+
+  1. THE GRAPH. If a graphify graph.json is named below, query it FIRST. It
+     already knows what renders a surface, what imports what, and which other
+     files sit next to the one you found. Guessing when the graph is there is
+     the most expensive mistake available to you: an under-predicted file list
+     is what makes the planner run two colliding leaves in parallel.
+  2. THE CODEBASE. No graph, or the graph does not cover it - grep for the
+     surface the request names: the label, the route, the component, the
+     column. Follow the imports out from what you hit.
+  3. THE STRUCTURE. Net-new work has nothing to grep, because the thing does
+     not exist yet. Read the directory and module layout and place the work
+     where its neighbours live - then add the registries that neighbours are
+     registered in."""
+
+
+def _recon_source_line(graph_path):
+    if graph_path and os.path.exists(graph_path):
+        return ("A graphify graph IS available at %s - query it FIRST, before "
+                "grepping. It is the difference between a predicted file list "
+                "and a guessed one." % graph_path)
+    return ("No graphify graph is available, so fall back to the codebase: grep "
+            "for the surface the request names, then follow imports; for net-new "
+            "work read the directory structure and place it beside its "
+            "neighbours.")
+
+
+def render_recon_prompt(ask, graph_path=None, template=None,
+                        contract=RECON_CONTRACT):
+    """The brief for ONE recon worker. Recon is the step that turns a plain ask
+    into items, and it is the only part of the system that can: mapping "add a
+    resolved filter" onto a file list is semantic, which no amount of stdlib
+    gets you. It runs as a subprocess for the same reason `--exec` does - the
+    LLM stays outside the tool."""
+    source = _recon_source_line(graph_path)
+    if template:
+        return (template.replace("{ask}", ask)
+                        .replace("{graph}", graph_path or "")
+                        .replace("{source}", source)
+                        .replace("{contract}", contract or ""))
+    return "%s\n\n%s\n\nRequest:\n%s" % (contract, source, ask)
+
+
+def run_recon(asks, exec_template, concurrency=4, cwd=None, poll=0.2,
+              run_dir=None, prompt_template=None, contract=RECON_CONTRACT,
+              graph_path=None):
+    """Turn plain text asks into items, one worker per ask, in parallel.
+
+    Returns (items, report). Asks are independent - MSP fusing is mechanical and
+    happens afterwards on the merged item list - so nothing here has to be
+    ordered. A worker that returns nothing usable is reported rather than
+    silently dropped: a missing ask is a missing PR."""
+    items, report, running = [], [], {}
+    pending = list(enumerate(asks))
+    seen = set()
+    # Worker output ALWAYS goes to a file, even with no run_dir: the structured
+    # line has to be read back, and an unread PIPE deadlocks a chatty worker
+    # once the buffer fills.
+    scratch = None if run_dir else tempfile.mkdtemp(prefix="fanout-recon-")
+    tmp = os.path.join(run_dir, "recon") if run_dir else scratch
+    os.makedirs(tmp, exist_ok=True)
+
+    def collect(idx, ask, proc, handles, out_path):
+        for h in handles:
+            h.close()
+        text = ""
+        if out_path:
+            try:
+                with open(out_path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                pass
+        parsed = [r for r in parse_returns(text) if isinstance(r.get("items"), list)]
+        got = parsed[-1]["items"] if parsed else []
+        kept = []
+        for it in got:
+            if not isinstance(it, dict) or not it.get("name") or not it.get("files"):
+                continue
+            name = str(it["name"])
+            while name in seen:                      # two asks can pick one name
+                name += "-2"
+            it["name"], seen_add = name, seen.add(name)
+            kept.append(it)
+        items.extend(kept)
+        entry = {"ask": ask, "items": [i["name"] for i in kept],
+                 "exit": proc.returncode}
+        if not kept:
+            entry["error"] = ("recon returned no usable items - this ask "
+                              "produced no work and no PR")
+        report.append(entry)
+
+    while pending or running:
+        for idx in [i for i, (p, _, _, _, _) in running.items() if p.poll() is not None]:
+            proc, ask, handles, out_path, _ = running.pop(idx)
+            collect(idx, ask, proc, handles, out_path)
+        while pending and len(running) < concurrency:
+            idx, ask = pending.pop(0)
+            prompt = render_recon_prompt(ask, graph_path, prompt_template,
+                                         contract)
+            argv = build_argv(exec_template, prompt, {"name": "recon-%d" % idx,
+                                                      "files": []})
+            env = dict(os.environ, FANOUT_RECON="1", FANOUT_ASK=ask,
+                       FANOUT_GRAPH=graph_path or "")
+            out_path = os.path.join(tmp, "ask-%d.out" % idx)
+            out = open(out_path, "w", encoding="utf-8")
+            proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out,
+                                    stderr=subprocess.STDOUT)
+            running[idx] = (proc, ask, [out], out_path, time.time())
+        if running:
+            time.sleep(poll)
+    if scratch:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return items, report
+
+
 def cluster_order(clusters, edges, items):
     """Dispatch priority: whatever unblocks the most work goes first.
 
@@ -1112,6 +1292,8 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
         # the riskiest leaf sets the cluster's tier: one agent does all of them
         return "top" if any(tier.get(n) == "top" for n in clusters[i]) else "cheap"
 
+    briefs = {b["cluster"]: b.get("prompt")
+              for b in plan_obj.get("cluster_briefs", []) if b.get("prompt")}
     pending = cluster_order(clusters, edges, items)
     status, running, records = {}, {}, []
 
@@ -1186,9 +1368,12 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
                 break
             pending.remove(nxt)
             members = clusters[nxt]
-            prompt = render_cluster_prompt(members, by_name, packs,
-                                           cluster_tier(nxt), order,
-                                           prompt_template, contract)
+            # Prefer the brief the PLAN already carries, so a hand-dispatching
+            # orchestrator and --exec send byte-identical instructions.
+            prebuilt = briefs.get(nxt) if not prompt_template else None
+            prompt = prebuilt or render_cluster_prompt(
+                members, by_name, packs, cluster_tier(nxt), order,
+                prompt_template, contract)
             head = by_name.get(members[0], {"name": members[0], "files": []})
             argv = build_argv(exec_template, prompt, head)
             if dry_run:
@@ -1245,7 +1430,20 @@ def main():
     ap.add_argument("--graph", default=None,
                     help="path to graphify graph.json (optional: without it the "
                          "plan loses only the import-adjacency coupling signal)")
-    ap.add_argument("--items", required=True,
+    ap.add_argument("--asks", default=None,
+                    help="plain text file, ONE ASK PER LINE. With --recon-exec, "
+                         "fanout derives the items itself instead of being handed "
+                         "them: each ask becomes one or more leaves with a task, "
+                         "an edited-file list, a complexity and an acceptance "
+                         "line. This is the whole point - the hard step is "
+                         "turning an ask into a file list, and it is semantic.")
+    ap.add_argument("--recon-exec", dest="recon_template", default=None,
+                    help="command template for the recon worker, run once per "
+                         "ask, e.g. 'claude -p {prompt}'. Required with --asks.")
+    ap.add_argument("--emit-items", default=None,
+                    help="with --asks: write the derived items JSON here so it "
+                         "can be read (and corrected) before anything is built")
+    ap.add_argument("--items", required=False,
                     help='JSON file: [{"name","files":[...],"contract_group"?:"tag",'
                          '"after"?:["producer-item", ...]}]')
     ap.add_argument("--risk-markers", default="",
@@ -1281,6 +1479,8 @@ def main():
                     help="most items dispatched at once (default 4)")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --exec: show the dispatch order and argv, spawn nothing")
+    ap.add_argument("--recon-prompt-template", default=None,
+                    help="override the recon brief; placeholders {ask} {contract}")
     ap.add_argument("--prompt-template", default=None,
                     help="override the per-item prompt; placeholders {name} {task} "
                          "{edit} {read} {tier}")
@@ -1308,8 +1508,31 @@ def main():
                     help="do not ask workers for a structured one-line result "
                          "(they will return prose, which is what bloats a caller)")
     args = ap.parse_args()
-    with open(args.items, encoding="utf-8") as f:
-        items = json.load(f)
+    if not args.items and not args.asks:
+        ap.error("give --items, or --asks with --recon-exec")
+    if args.asks and not args.recon_template:
+        ap.error("--asks needs --recon-exec: deriving items from plain text is "
+                 "an LLM job, and fanout runs it as a subprocess rather than "
+                 "doing it itself")
+    recon_report = None
+    if args.asks:
+        with open(args.asks, encoding="utf-8") as f:
+            asks = [line.strip() for line in f if line.strip()]
+        items, recon_report = run_recon(asks, args.recon_template,
+                                        args.concurrency,
+                                        run_dir=args.run_dir,
+                                        prompt_template=args.recon_prompt_template,
+                                        graph_path=args.graph)
+        if args.emit_items:
+            with open(args.emit_items, "w", encoding="utf-8") as f:
+                json.dump(items, f, indent=2)
+        if not items:
+            print(json.dumps({"recon": recon_report,
+                              "error": "recon produced no items"}, indent=2))
+            raise SystemExit(1)
+    else:
+        with open(args.items, encoding="utf-8") as f:
+            items = json.load(f)
     markers = [m for m in args.risk_markers.split(",") if m]
     serial_markers = [m for m in args.serial_verify_markers.split(",") if m]
     trajectories = [] if args.no_trajectories else load_trajectories(args.trajectories)
@@ -1321,6 +1544,8 @@ def main():
                         serial_markers, args.context_hops,
                         args.max_context_files, args.coalesce_below,
                         args.coalesce_max)
+    if recon_report is not None:
+        computed["recon"] = recon_report
     if not args.exec_template:
         print(json.dumps(computed, indent=2))
         return

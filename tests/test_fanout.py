@@ -707,5 +707,112 @@ class ClusterDispatch(unittest.TestCase):
     def test_multi_leaf_returns_are_all_kept(self):
         self.assertEqual(len(fp.parse_returns('{"a":1}\nnoise\n{"b":2}')), 2)
 
+
+class Recon(unittest.TestCase):
+    """Deriving items from plain asks - the step that makes fanout usable
+    without the caller doing the hard part first."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.stub = os.path.join(self.tmp, "stub.py")
+        with open(self.stub, "w") as f:
+            f.write(
+                "import sys, json\n"
+                "ask = sys.argv[1]\n"
+                "if 'UNANSWERABLE' in ask:\n"
+                "    print('I could not work that out'); raise SystemExit(0)\n"
+                "print(json.dumps({'items': [\n"
+                "  {'name': 'be', 'task': 'build the endpoint',\n"
+                "   'files': ['api/x.py'], 'complexity': 'complex',\n"
+                "   'acceptance': 'returns 200'},\n"
+                "  {'name': 'fe', 'task': 'build the form',\n"
+                "   'files': ['web/x.tsx'], 'complexity': 'simple'}]}))\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _exec(self):
+        return "%s %s {prompt}" % (shlex.quote(sys.executable),
+                                   shlex.quote(self.stub))
+
+    def test_one_ask_becomes_several_items(self):
+        items, report = fp.run_recon(["add a login form"], self._exec())
+        self.assertEqual(sorted(i["name"] for i in items), ["be", "fe"])
+        self.assertEqual(report[0]["items"], ["be", "fe"])
+
+    def test_derived_items_carry_the_brief_into_the_plan(self):
+        items, _ = fp.run_recon(["add a login form"], self._exec())
+        pl = fp.plan(items, None, [], trajectories=[])
+        self.assertNotIn("underspecified", pl)          # recon supplied tasks
+        self.assertEqual(pl["tier"]["be"], "top")       # complexity axis applied
+        self.assertEqual(pl["tier"]["fe"], "cheap")
+        prompt = fp.render_cluster_prompt(
+            ["be"], {i["name"]: i for i in items}, pl["context_packs"],
+            "top", [], None, None)
+        self.assertIn("build the endpoint", prompt)
+        self.assertIn("returns 200", prompt)
+
+    def test_name_collisions_across_asks_are_kept_distinct(self):
+        items, _ = fp.run_recon(["one", "two"], self._exec(), concurrency=2)
+        self.assertEqual(len(items), 4)
+        self.assertEqual(len(set(i["name"] for i in items)), 4)
+
+    def test_an_ask_that_yields_nothing_is_reported_not_dropped(self):
+        items, report = fp.run_recon(["UNANSWERABLE"], self._exec())
+        self.assertEqual(items, [])
+        self.assertIn("error", report[0])
+
+    def test_graph_is_named_in_the_brief_when_present(self):
+        g = os.path.join(self.tmp, "graph.json")
+        open(g, "w").write("{}")
+        with_graph = fp.render_recon_prompt("x", g)
+        self.assertIn(g, with_graph)
+        self.assertIn("query it FIRST", with_graph)
+        without = fp.render_recon_prompt("x", None)
+        self.assertIn("No graphify graph", without)
+        self.assertIn("grep", without)
+
+
+class ClusterBriefs(unittest.TestCase):
+    """The plan carries what a subagent must be told, so an orchestrator that
+    dispatches its own agents sends the same thing --exec would."""
+
+    def test_plan_carries_a_brief_per_cluster(self):
+        items = [{"name": "a", "files": ["x.py"], "task": "do a",
+                  "acceptance": "a works"},
+                 {"name": "b", "files": ["y.py"], "task": "do b",
+                  "after": ["a"]}]
+        pl = fp.plan(items, None, [], trajectories=[])
+        briefs = pl["cluster_briefs"]
+        self.assertEqual(len(briefs), len(pl["clusters"]))
+        for b in briefs:
+            self.assertTrue(b["prompt"])
+            self.assertIn("msp", b)
+            self.assertIn(b["tier"], ("top", "cheap"))
+        a = next(b for b in briefs if b["leaves"] == ["a"])
+        self.assertIn("do a", a["prompt"])
+        self.assertIn("a works", a["prompt"])
+        b = next(x for x in briefs if x["leaves"] == ["b"])
+        self.assertEqual(b["after_clusters"], [a["cluster"]])
+
+    def test_exec_sends_the_plans_brief_verbatim(self):
+        items = [{"name": "a", "files": ["x.py"], "task": "do a"}]
+        pl = fp.plan(items, None, [], trajectories=[])
+        res = fp.run_plan(pl, items, "true {prompt}", dry_run=True)
+        sent = res["dispatched"][0]["argv"][-1]
+        self.assertEqual(sent, pl["cluster_briefs"][0]["prompt"])
+
+    def test_brief_names_the_msp_each_cluster_belongs_to(self):
+        items = [{"name": "iface", "files": ["s.json"], "type": "contract",
+                  "contract_group": "g", "task": "t"},
+                 {"name": "be", "files": ["api.py"], "contract_group": "g",
+                  "after": ["iface"], "task": "t"},
+                 {"name": "fe", "files": ["ui.tsx"], "contract_group": "g",
+                  "after": ["iface"], "task": "t"}]
+        pl = fp.plan(items, None, [], trajectories=[])
+        msps = {b["msp"] for b in pl["cluster_briefs"]}
+        self.assertEqual(len(msps), 1)        # three clusters, one MSP, one PR
+        self.assertEqual(len(pl["cluster_briefs"]), 3)
+
 if __name__ == "__main__":
     unittest.main()
