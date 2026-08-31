@@ -1,6 +1,6 @@
 ---
 name: fanout
-description: Use whenever 2+ work-items are on the table in one session - a board with several Open tickets, a multi-finding fix wave, several asks in one or successive user messages - BEFORE starting any of them, and AGAIN when new items arrive mid-session (re-batch; do not queue new asks behind the current item). Not just for when a fan-out is already decided - this tool is HOW you decide: it computes the MSPs (one MSP = one branch = one PR), splits each into clusters (the unit one agent owns and walks sequentially), carries dependency edges at cluster granularity so one blocked leaf never gates its siblings, and tiers each cluster by blast radius x complexity. Consumed by ship (step 0) and proto-port (plan step). The project supplies the risk-marker taxonomy and any graph path; this tool bakes in no project paths.
+description: Use whenever 2+ work-items are on the table in one session - a board with several Open tickets, a multi-finding fix wave, several asks in one or successive user messages - BEFORE starting any of them, and AGAIN when new items arrive mid-session (re-batch; do not queue new asks behind the current item). Not just for when a fan-out is already decided - this tool is HOW you decide: it computes the MSPs (one MSP = one branch = one PR), splits each into clusters (the unit one agent owns and walks sequentially), carries dependency edges at cluster granularity so one blocked leaf never gates its siblings, and tiers each cluster by blast radius x complexity. Runs standalone - stdlib only, no git, no network. Orchestrators consume the plan (in this environment, `ship` at step 0 and `proto-port` at its plan step). The project supplies the risk-marker taxonomy and any graph path; this tool bakes in no project paths.
 ---
 
 # fanout
@@ -8,11 +8,12 @@ description: Use whenever 2+ work-items are on the table in one session - a boar
 Turn "fan out only on disjoint files" from manual judgment into a computed plan -
 and, with `--exec`, into the dispatch itself.
 
-**Boundary: fanout schedules and (optionally) dispatches; `ship` owns the job.**
+**Boundary: fanout schedules and (optionally) dispatches; the CONSUMER owns the job.**
 It plans in seconds, deterministically, and touches no git and ships nothing. With
 `--exec` it will spawn one process per item along the dependency DAG, but it still
 never commits, merges, gates or closes anything - the gated spine, verification and
-close-outs stay with the CONSUMER (`ship` for work-sets, `proto-port` for ports).
+close-outs stay with the CONSUMER - whatever loop you run (here, `ship` for work-sets
+and `proto-port` for ports).
 Use `--exec` when you want the plan EXECUTED rather than followed by hand; leave it
 off when the consumer is doing its own dispatching.
 
@@ -281,10 +282,11 @@ across waves and WITHIN one, since a wave wider than your concurrency cap queues
   treat a big cluster as one serial lump - the waves ARE its internal
   parallelism. Sequential (e.g. subagent-driven) execution is for clique tails
   and coupled chains only. The speed win is real only if you actually fan out; a
-  careful orchestrator defaults to serial and loses it otherwise. How clusters
-  become MSPs/PRs and who ships them: the `ship` skill's "MSPs"
-  section is canonical - a serialize-together cluster ships as ONE PR; `after`
-  orders separate MSPs without merging them.
+  careful orchestrator defaults to serial and loses it otherwise. How clusters become
+  MSPs/PRs: this planner computes `msps` and that is the definition - one MSP is one
+  branch and one PR, a serialize-together cluster ships as ONE PR, and `after` orders
+  separate MSPs without merging them. WHO ships them is the consumer's business; this
+  tool touches no git.
 - Risk markers match a WORD of the path, case-insensitively - `auth` fires on
   `types/AuthResponse.ts` and on `app/auth/route.ts`, but NOT inside
   `(unauthenticated)`. A marker containing a separator (`api/auth`, `.sql`) is
@@ -353,6 +355,7 @@ across waves and WITHIN one, since a wave wider than your concurrency cap queues
   precise joins.
 
 ## Related
-- `ship` (step 0 + batching), `proto-port` (plan step) - the consumers.
+- Example consumers in this environment: `ship` (step 0), `proto-port` (plan step).
+  fanout does not require either - the JSON plan is the whole contract.
 - `graphify` - produces the `graph.json` this reads.
 - A trajectory-memory store (whichever MCP/plugin the setup provides) - the optional history this reads for history-aware tiering + the `regression-history` coupling signal.
