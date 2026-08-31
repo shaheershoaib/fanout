@@ -1184,7 +1184,17 @@ def prepare_worktrees(msps, base, root, repo=None, prefix="fanout/"):
         label = _slug(members[0] if len(members) == 1 else "msp-%d" % i)
         branch, path = prefix + label, os.path.join(root, label)
         if not os.path.exists(path):
-            _git(["worktree", "add", "-b", branch, path, base], cwd=repo)
+            # A second run - or a --resume after the tree was cleaned up - finds
+            # the branch already there. Reuse it instead of failing: `-b` on an
+            # existing branch is an error, and refusing to start is the wrong
+            # answer when the work is sitting on that branch.
+            exists = subprocess.run(["git", "rev-parse", "--verify", "--quiet",
+                                     "refs/heads/" + branch],
+                                    cwd=repo, capture_output=True).returncode == 0
+            if exists:
+                _git(["worktree", "add", path, branch], cwd=repo)
+            else:
+                _git(["worktree", "add", "-b", branch, path, base], cwd=repo)
         out[i] = {"path": path, "branch": branch, "label": label}
     return out
 
@@ -1442,8 +1452,20 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
                     records.append({"item": label(i), "cluster": label(i),
                                     "status": "resumed", "exit": 0})
 
+    finished = {}          # msp index -> branch, once its work is committed
+
     def ok(i):
-        return all(status.get(d) == "ok" for d in edges.get(i, []))
+        for d in edges.get(i, []):
+            if status.get(d) != "ok":
+                return False
+            # A cross-MSP producer must also be COMMITTED, because the consumer
+            # works in a different tree: waiting for the producer's build is
+            # useless if its code is not visible here. Same-MSP producers share
+            # the tree, so their work is already on disk.
+            other = cluster_msp.get(d)
+            if trees and other != cluster_msp.get(i) and other not in finished:
+                return False
+        return True
 
     def doomed(i):
         return any(status.get(d) in ("failed", "blocked") for d in edges.get(i, []))
@@ -1483,8 +1505,12 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
             if m in trees and all(status.get(c) == "ok"
                                   for c, mm in cluster_msp.items() if mm == m):
                 try:
-                    msp_results.append(finish_msp(trees[m], msps[m], pr_template,
-                                                  cwd, base or "HEAD", push_remote))
+                    done = finish_msp(trees[m], msps[m], pr_template,
+                                      cwd, base or "HEAD", push_remote)
+                    if done.get("status") in ("committed", "pr-opened", "pr-failed",
+                                              "no-changes"):
+                        finished[m] = trees[m]["branch"]
+                    msp_results.append(done)
                 except (RuntimeError, OSError) as exc:
                     msp_results.append({"msp": trees[m]["label"],
                                         "status": "finish-failed",
@@ -1504,6 +1530,21 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
                 break
             pending.remove(nxt)
             members = clusters[nxt]
+            # Bring every cross-MSP producer's committed work INTO this tree
+            # before the agent starts. Without this the consumer builds against
+            # the base revision and the dependency is honoured in timing only.
+            mine = cluster_msp.get(nxt)
+            for d in edges.get(nxt, []):
+                other = cluster_msp.get(d)
+                if trees and other != mine and other in finished:
+                    merged = subprocess.run(
+                        ["git", "merge", "--no-edit", finished[other]],
+                        cwd=trees[mine]["path"], capture_output=True, text=True)
+                    if merged.returncode != 0:
+                        msp_results.append({
+                            "msp": trees[mine]["label"], "status": "merge-failed",
+                            "from": finished[other],
+                            "error": (merged.stderr or "").strip()[:300]})
             # Prefer the brief the PLAN already carries, so a hand-dispatching
             # orchestrator and --exec send byte-identical instructions.
             prebuilt = briefs.get(nxt) if not prompt_template else None

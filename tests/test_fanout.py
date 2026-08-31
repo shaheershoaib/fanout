@@ -926,6 +926,43 @@ class BranchPerMSP(unittest.TestCase):
         self.assertEqual(res.get("msps", []), [])     # nothing committed
         self.assertEqual(res["summary"].get("failed"), 2)
 
+    def test_a_consumer_sees_its_producers_committed_work(self):
+        """Waiting is not enough. A cross-MSP consumer works in a DIFFERENT
+        tree, so unless the producer's commit is brought in it builds against
+        the base revision and the dependency is honoured in timing only."""
+        probe = os.path.join(self.repo, "probe.py")
+        open(probe, "w").write(
+            "import os, json, pathlib\n"
+            "c = os.environ['FANOUT_CLUSTER']\n"
+            "if c == 'consumer':\n"
+            "    pathlib.Path('seen.txt').write_text(pathlib.Path('api/x.py').read_text())\n"
+            "for f in os.environ.get('FANOUT_FILES','').split(','):\n"
+            "    if f:\n"
+            "        p = pathlib.Path(f); p.parent.mkdir(parents=True, exist_ok=True)\n"
+            "        p.write_text('by ' + c + chr(10))\n"
+            "print(json.dumps({'item': c, 'status':'ok', 'files_changed': [],"
+            " 'notes':'d'}))\n")
+        items = [{"name": "producer", "files": ["api/x.py"], "task": "t"},
+                 {"name": "consumer", "files": ["web/y.tsx"], "task": "t",
+                  "after": ["producer"]}]
+        pl = fp.plan(items, None, [], trajectories=[])
+        fp.run_plan(pl, items, "%s %s" % (sys.executable, probe),
+                    cwd=self.repo, push_remote=None)
+        seen = os.path.join(self.repo, ".fanout", "trees", "consumer", "seen.txt")
+        self.assertTrue(os.path.exists(seen), "consumer never ran")
+        self.assertEqual(open(seen).read().strip(), "by producer")
+
+    def test_rerun_reuses_an_existing_branch(self):
+        """A second run, or a --resume after the tree was cleaned up, finds the
+        branch already there. `worktree add -b` errors on that, and refusing to
+        start is wrong when the work is sitting on that branch."""
+        self._g(["branch", "fanout/a"])
+        trees = fp.prepare_worktrees([["a"]], "main",
+                                     os.path.join(self.repo, ".fanout", "t"),
+                                     repo=self.repo)
+        self.assertTrue(os.path.isdir(trees[0]["path"]))
+        self.assertEqual(trees[0]["branch"], "fanout/a")
+
     def test_no_branches_escape_hatch_uses_one_tree(self):
         items = [{"name": "a", "files": ["api/x.py"], "task": "t"}]
         _, res = self._run(items, branches=False)
