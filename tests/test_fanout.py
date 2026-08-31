@@ -1041,5 +1041,51 @@ class BriefParity(unittest.TestCase):
         prompt = pl["cluster_briefs"][0]["prompt"]
         self.assertLess(prompt.index('"B"'), prompt.index('"A"'))
 
+
+class ReconOutputIsUntrusted(unittest.TestCase):
+    """Recon is an LLM running one worker per ask. Its output is a guess, and
+    the planner must survive a bad one without losing the whole batch."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _worker(self, body):
+        path = os.path.join(self.tmp, "s.py")
+        open(path, "w").write(body)
+        return "%s %s {prompt}" % (shlex.quote(sys.executable), shlex.quote(path))
+
+    def test_an_invented_after_drops_the_edge_not_the_batch(self):
+        """Workers cannot see each other's leaf names, so a cross-ask `after`
+        is a guess. Raising on it would cost every PR in the run."""
+        tpl = self._worker(
+            "import json\nprint(json.dumps({'items':[{'name':'x','task':'t',"
+            "'files':['a.py'],'after':['ghost']}]}))\n")
+        items, report = fp.run_recon(["do a thing"], tpl)
+        self.assertEqual(items[0]["after"], [])
+        self.assertTrue(any("dropped_after" in r for r in report))
+        fp.plan(items, None, [], trajectories=[])   # and the plan still builds
+
+    def test_an_item_with_no_predicted_files_is_named(self):
+        """No files means it collides with nothing, so it looks safely parallel
+        with everything - which is also what a recon failure looks like."""
+        pl = fp.plan([{"name": "a", "files": [], "task": "t"},
+                      {"name": "b", "files": ["y.py"], "task": "t"}],
+                     None, [], trajectories=[])
+        self.assertEqual(pl["unpredicted"], ["a"])
+
+    def test_duplicate_names_are_rejected(self):
+        with self.assertRaises(ValueError):
+            fp.plan([{"name": "a", "files": ["x.py"]},
+                     {"name": "a", "files": ["y.py"]}], None, [], trajectories=[])
+
+    def test_a_cycle_is_refused_rather_than_planned(self):
+        with self.assertRaises(ValueError):
+            fp.plan([{"name": "a", "files": ["x.py"], "after": ["b"]},
+                     {"name": "b", "files": ["y.py"], "after": ["a"]}],
+                    None, [], trajectories=[])
+
 if __name__ == "__main__":
     unittest.main()
