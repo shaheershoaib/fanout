@@ -52,6 +52,24 @@ own PR and invites a partial merge.
 
 ## Pipeline
 
+```mermaid
+flowchart TB
+  A["plain text asks"] --> R["<b>recon</b><br/>graphify → grep → structural<br/><i>one ask may split into several items</i>"]
+  R --> G["<b>group into MSPs</b><br/>shared file or contract_group<br/>+ shippability test"]
+  G --> W["<b>schedule MSPs</b><br/>waves · ready_after"]
+  W --> S["<b>split each MSP into clusters</b><br/><i>contract pinned → parallel<br/>unpinned → one owner</i>"]
+  S --> T["<b>tier</b><br/>blast radius × complexity"]
+  T --> D["<b>dispatch</b><br/>one process per cluster"]
+  D --> B["clusters converge<br/>into ONE branch per MSP"]
+  B --> P["<b>draft PR</b><br/><i>all clusters succeeded<br/>AND every receipt present</i>"]
+  D --> C["<b>reconcile</b><br/>predicted vs actual files"]
+
+  style R fill:#1f6feb22,stroke:#1f6feb
+  style G fill:#1f6feb22,stroke:#1f6feb
+  style P fill:#2da44e22,stroke:#2da44e
+  style C fill:#bf872922,stroke:#bf8729
+```
+
 Order matters: **discovery precedes clustering.** MSPs are computed *from* file
 overlap, so files must exist before grouping can happen.
 
@@ -80,7 +98,7 @@ overlap, so files must exist before grouping can happen.
 5. **Split each MSP into clusters** — the MSP's subgraph gives its internal
    parallelism, **subject to the contract rule below**. An MSP with no internal
    disjointness is a single cluster.
-6. **Tier** — per cluster, from risk markers and trajectory history.
+6. **Tier** — per cluster, from blast radius *and* complexity (see below).
 7. **Dispatch** — one process per cluster along the DAG. All clusters of one MSP
    converge into that MSP's single branch.
 8. **PR** — when an MSP completes, open a draft PR for its branch.
@@ -104,6 +122,33 @@ The rule has two branches:
 
 Pinning is what real teams do — agree the interface, then build both sides at
 once. It is the only way `contract_group` members may be split.
+
+## Tiering: add complexity as a second axis
+
+Today `tier_for()` is one line — if any edited path matches a caller-supplied
+risk marker the item is `top`, otherwise `cheap` — with
+`history_tier_bump()` raising an item whose surface has a bad track record
+(reverts, speculative ships, caused regressions, two or more prior traps).
+History only ever raises caution, never lowers it.
+
+That is **blast radius only**. A one-word copy change under `api/auth/` is
+`top`; a genuinely hard refactor in an unmarked directory is `cheap`. Routing
+models off that axis alone sends the capable model to trivial work and the cheap
+model to hard work.
+
+v2 adds the axis that was missing, because recon is an LLM and can judge it:
+
+| | low blast radius | high blast radius |
+|---|---|---|
+| **simple** | cheap | top |
+| **complex** | top | top |
+
+Cheap only when the work is *both* mechanical and low-blast-radius. Everything
+else goes top — the asymmetry is deliberate, since a wrong cheap-tier call costs
+a rebuild and a wrong top-tier call costs tokens.
+
+Fanout still emits `top` / `cheap`, never a model name. Which model each tier
+maps to is the caller's, and model names change faster than this tool should.
 
 ## Item schema
 
