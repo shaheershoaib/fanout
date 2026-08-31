@@ -42,6 +42,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -545,7 +546,8 @@ def coupling_review(items, adj, risk_markers, trajectories=None):
             if any(bf in adj.get(af, ()) for af in gfiles[a] for bf in gfiles[b]):
                 signals.append("import-adjacent")
             shared = sorted({m for m in risk_markers
-                             if any(m in f for f in files[a]) and any(m in f for f in files[b])})
+                             if any(marker_matches(f, m) for f in files[a])
+                             and any(marker_matches(f, m) for f in files[b])})
             signals += ["shared-risk-marker:" + m for m in shared]
             regression = (any(_entry_regresses_item(e, by_name[b]) for e in matched[a])
                           or any(_entry_regresses_item(e, by_name[a]) for e in matched[b]))
@@ -557,6 +559,41 @@ def coupling_review(items, adj, risk_markers, trajectories=None):
                 out.append({"pair": [a, b], "signals": signals,
                             "default": "serialize" if (shared or regression or mig) else "parallel"})
     return out
+
+
+_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _path_words(path):
+    """The words in a path, split on separators AND camelCase, lowercased.
+
+    `app/types/AuthResponse.ts` -> {app, types, auth, response, ts}
+    `app/(unauthenticated)/x`   -> {app, unauthenticated, x}
+
+    The second one is the whole point: "unauthenticated" is one word and does
+    NOT contain the word "auth", even though it contains the substring."""
+    return {w.lower() for part in re.split(r"[^A-Za-z0-9]+", path) if part
+            for w in _WORD.findall(part)}
+
+
+def marker_matches(path, marker):
+    """Does a risk marker apply to this path?
+
+    Raw substring matching was wrong in both directions at once: marker `auth`
+    fired on `app/(unauthenticated)/forgotPassword/page.tsx` (a copy change sent
+    to the expensive model) and missed `app/types/AuthResponse.ts` (auth code
+    sent to the cheap one).
+
+    So: a plain marker matches a WORD of the path, case-insensitively. A marker
+    containing any separator (`api/auth`, `.sql`) is meant as a path fragment and
+    keeps case-insensitive substring behaviour, since that is the only thing it
+    could mean."""
+    m = marker.strip().lower()
+    if not m:
+        return False
+    if not m.isalnum():
+        return m in path.lower()
+    return m in _path_words(path)
 
 
 def tier_for(file_paths, risk_markers, complexity=None):
@@ -577,7 +614,7 @@ def tier_for(file_paths, risk_markers, complexity=None):
     blast-radius-only behaviour, so a caller that does not supply it is
     unaffected."""
     for f in file_paths:
-        if any(m in f for m in risk_markers):
+        if any(marker_matches(f, m) for m in risk_markers):
             return "top"
     if complexity is not None and str(complexity).lower() not in ("simple", "low",
                                                                  "mechanical"):

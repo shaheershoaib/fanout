@@ -600,5 +600,35 @@ class V2Planner(unittest.TestCase):
         for key in ("msps", "clusters", "plan_id", "tier"):
             self.assertIn(key, pl)
 
+
+class MarkerMatching(unittest.TestCase):
+    """Substring matching was wrong in both directions on the same run."""
+
+    def test_marker_does_not_fire_inside_a_longer_word(self):
+        self.assertFalse(fp.marker_matches(
+            "app/(unauthenticated)/forgotPassword/page.tsx", "auth"))
+
+    def test_marker_fires_on_a_camelcase_word(self):
+        self.assertTrue(fp.marker_matches("app/types/AuthResponse.ts", "auth"))
+
+    def test_marker_fires_on_a_path_segment(self):
+        self.assertTrue(fp.marker_matches("app/auth/api/route.ts", "auth"))
+
+    def test_marker_is_case_insensitive_both_ways(self):
+        self.assertTrue(fp.marker_matches("app/AUTH/x.ts", "auth"))
+        self.assertTrue(fp.marker_matches("app/auth/x.ts", "AUTH"))
+
+    def test_path_shaped_marker_keeps_substring_behaviour(self):
+        self.assertTrue(fp.marker_matches("src/api/auth/login.py", "api/auth"))
+        self.assertFalse(fp.marker_matches("src/api/users/x.py", "api/auth"))
+        self.assertTrue(fp.marker_matches("db/0001_init.sql", ".sql"))
+
+    def test_tier_uses_it(self):
+        self.assertEqual(
+            fp.tier_for(["app/(unauthenticated)/forgotPassword/page.tsx"],
+                        ["auth"]), "cheap")
+        self.assertEqual(fp.tier_for(["app/types/AuthResponse.ts"], ["auth"]),
+                         "top")
+
 if __name__ == "__main__":
     unittest.main()

@@ -234,6 +234,10 @@ across waves and WITHIN one, since a wave wider than your concurrency cap queues
   become MSPs/PRs and who ships them: the `ship` skill's "MSPs"
   section is canonical - a serialize-together cluster ships as ONE PR; `after`
   orders separate MSPs without merging them.
+- Risk markers match a WORD of the path, case-insensitively - `auth` fires on
+  `types/AuthResponse.ts` and on `app/auth/route.ts`, but NOT inside
+  `(unauthenticated)`. A marker containing a separator (`api/auth`, `.sql`) is
+  read as a path fragment and keeps substring behaviour.
 - Map `tier` to the model per leaf; the orchestrator + every review/gate/ship step
   stays top-tier. `tier` now reads TWO axes - blast radius (path markers, plus a
   history bump) and `complexity` when the item supplies it. `cheap` requires BOTH
