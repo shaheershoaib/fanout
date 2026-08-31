@@ -1208,9 +1208,16 @@ def prepare_worktrees(msps, base, root, repo=None, prefix="fanout/"):
 
     Returns {msp index: {"path", "branch"}}."""
     os.makedirs(root, exist_ok=True)
-    out = {}
+    out, taken = {}, set()
     for i, members in enumerate(msps):
         label = _slug(members[0] if len(members) == 1 else "msp-%d" % i)
+        # Slugging is lossy: `api/users` and `api-users` both become
+        # `api-users`. Two MSPs sharing one worktree path would have them
+        # editing each other's files on one branch - the exact thing MSPs
+        # exist to prevent - so disambiguate rather than collide.
+        if label in taken:
+            label = "%s-%d" % (label, i)
+        taken.add(label)
         branch, path = prefix + label, os.path.join(root, label)
         if not os.path.exists(path):
             # A second run - or a --resume after the tree was cleaned up - finds
@@ -1461,6 +1468,7 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
 
     pending = cluster_order(clusters, edges, items)
     status, running, records = {}, {}, []
+    finished = {}          # msp index -> branch, once its work is committed
 
     state = {"plan_id": pid, "items": {}}
     if run_dir and not dry_run:
@@ -1480,8 +1488,15 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
                     status[i] = "ok"
                     records.append({"item": label(i), "cluster": label(i),
                                     "status": "resumed", "exit": 0})
-
-    finished = {}          # msp index -> branch, once its work is committed
+            # An MSP whose clusters all succeeded in a PRIOR run was committed
+            # then. Without re-deriving that, a consumer of it waits on an MSP
+            # nothing will ever finish again and is blocked as unsatisfiable -
+            # so --resume could never complete a batch with a cross-MSP edge,
+            # which is the case resume exists for.
+            for m, tree in trees.items():
+                mine = [c for c, mm in cluster_msp.items() if mm == m]
+                if mine and all(status.get(c) == "ok" for c in mine):
+                    finished[m] = tree["branch"]
 
     def ok(i):
         for d in edges.get(i, []):

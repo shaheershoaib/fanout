@@ -963,6 +963,48 @@ class BranchPerMSP(unittest.TestCase):
         self.assertTrue(os.path.isdir(trees[0]["path"]))
         self.assertEqual(trees[0]["branch"], "fanout/a")
 
+    def test_resume_completes_a_batch_with_a_cross_msp_edge(self):
+        """The case --resume exists for. An MSP committed in a PRIOR run must
+        still count as finished, or its consumer waits on something nothing
+        will finish again and is blocked as unsatisfiable."""
+        worker = os.path.join(self.repo, "p.py")
+        open(worker, "w").write(
+            "import os, json, pathlib, sys\n"
+            "c = os.environ['FANOUT_CLUSTER']\n"
+            "if c == 'consumer' and os.environ.get('FAIL') == '1':\n"
+            "    sys.exit(1)\n"
+            "for f in os.environ.get('FANOUT_FILES','').split(','):\n"
+            "    if f:\n"
+            "        p = pathlib.Path(f); p.parent.mkdir(parents=True, exist_ok=True)\n"
+            "        p.write_text('by ' + c + chr(10))\n"
+            "print(json.dumps({'item': c, 'status':'ok', 'files_changed': [],"
+            " 'notes':'d'}))\n")
+        items = [{"name": "producer", "files": ["api/x.py"], "task": "t"},
+                 {"name": "consumer", "files": ["web/y.tsx"], "task": "t",
+                  "after": ["producer"]}]
+        pl = fp.plan(items, None, [], trajectories=[])
+        rd = os.path.join(self.repo, "rd")
+        cmd = "%s %s" % (sys.executable, worker)
+        os.environ["FAIL"] = "1"
+        try:
+            fp.run_plan(pl, items, cmd, cwd=self.repo, run_dir=rd,
+                        push_remote=None)
+        finally:
+            os.environ.pop("FAIL", None)
+        res = fp.run_plan(pl, items, cmd, cwd=self.repo, run_dir=rd,
+                          resume=True, push_remote=None)
+        by = {r["cluster"]: r["status"] for r in res["dispatched"]}
+        self.assertEqual(by["producer"], "resumed")
+        self.assertEqual(by["consumer"], "ok")   # not "blocked"
+
+    def test_labels_that_slug_alike_get_separate_worktrees(self):
+        """`api/users` and `api-users` both slug to `api-users`. Sharing one
+        tree would put two MSPs on one branch editing each other's files."""
+        trees = fp.prepare_worktrees([["api/users"], ["api-users"]], "main",
+                                     os.path.join(self.repo, ".fanout", "s"),
+                                     repo=self.repo)
+        self.assertEqual(len({v["path"] for v in trees.values()}), 2)
+
     def test_no_branches_escape_hatch_uses_one_tree(self):
         items = [{"name": "a", "files": ["api/x.py"], "task": "t"}]
         _, res = self._run(items, branches=False)
