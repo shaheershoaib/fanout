@@ -135,6 +135,32 @@ The rule has two branches:
 Pinning is what real teams do — agree the interface, then build both sides at
 once. It is the only way `contract_group` members may be split.
 
+## Cross-MSP dependencies
+
+Nothing waits, so fanout cannot express "build B after A merges." A dependency
+between two proposed MSPs must be resolved by recon at plan time. What B needs
+from A decides how:
+
+**B needs A's interface only.** Do not fuse. Pin the contract, and both halves
+build in parallel inside one MSP — the contract rule above.
+
+**B needs A's code to exist.** A real dependency, and reviewability decides:
+
+- *Fused result still reviewable and coherent* → **fuse**. One MSP, one PR. The
+  dependency becomes an edge inside a cluster and one agent walks it.
+- *Fused result too big* — roughly 800 changed lines, or it crosses a high-risk
+  boundary mid-way → **defer**. Dispatch A in this run and leave B out of it
+  entirely; run fanout again once A has merged. Stacked MSPs, two runs.
+
+Fusing is the default for a genuine dependency, bounded by reviewability.
+Fusing *every* dependent pair would collapse a large batch into one
+unreviewable PR, which fails the MSP definition from the other direction.
+
+**State the consequence plainly:** a batch containing a deferred cross-MSP
+dependency is not fully dispatched in one run. That is the price of "nothing
+ever waits," and it is charged at plan time where it is visible, rather than as
+a scheduler that can stall.
+
 ## Tiering: add complexity as a second axis
 
 Today `tier_for()` is one line — if any edited path matches a caller-supplied
