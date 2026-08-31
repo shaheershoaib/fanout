@@ -111,8 +111,10 @@ split.
    steps. A dependency recon can see belongs in the graph, where it costs one
    sequential step inside a cluster instead of a wrong build.
 5. **Tier** — per cluster, from blast radius *and* complexity (see below).
-6. **Dispatch** — one process per cluster, all at once; nothing waits. All
-   clusters of one MSP converge into that MSP's single branch.
+6. **Dispatch** — one process per cluster. An MSP's clusters all start at once
+   and converge into that MSP's single branch. An MSP with an `after` edge
+   starts when its producer's build completes, branching off the producer's
+   branch.
 7. **PR** — when an MSP completes, open a draft PR for its branch.
 8. **Reconcile** — compare each cluster's returned `files_changed` against what
    recon predicted.
@@ -137,29 +139,31 @@ once. It is the only way `contract_group` members may be split.
 
 ## Cross-MSP dependencies
 
-Nothing waits, so fanout cannot express "build B after A merges." A dependency
-between two proposed MSPs must be resolved by recon at plan time. What B needs
-from A decides how:
+**One run handles the whole batch.** A dependency between MSPs is an *edge*, not
+a barrier: B starts the moment A specifically is done, and no other MSP waits
+with it.
 
-**B needs A's interface only.** Do not fuse. Pin the contract, and both halves
-build in parallel inside one MSP — the contract rule above.
+What B needs from A decides the shape:
 
-**B needs A's code to exist.** A real dependency, and reviewability decides:
+**B needs A's interface only.** Nothing is ordered. Pin the contract and build
+both halves in parallel inside one MSP — the contract rule above.
 
-- *Fused result still reviewable and coherent* → **fuse**. One MSP, one PR. The
-  dependency becomes an edge inside a cluster and one agent walks it.
-- *Fused result too big* — roughly 800 changed lines, or it crosses a high-risk
-  boundary mid-way → **defer**. Dispatch A in this run and leave B out of it
-  entirely; run fanout again once A has merged. Stacked MSPs, two runs.
+**B needs A's code to exist.** B declares `after: [A]` and dispatches when A's
+last cluster returns. "Done" means **A's build completed**, not A merged — A's
+branch already holds the code, so B branches off A's branch and its PR stacks on
+A's. No merge is required mid-run.
 
-Fusing is the default for a genuine dependency, bounded by reviewability.
-Fusing *every* dependent pair would collapse a large batch into one
-unreviewable PR, which fails the MSP definition from the other direction.
+- The stacking risk is real and worth stating: if A's PR changes in review, B
+  rebases. That is the cost of pipelining instead of waiting for a human.
+- **Fusing stays available** when the two are small enough that one PR is the
+  better unit — the dependency then becomes an edge inside a cluster and one
+  agent walks it. Prefer fusing only when the fused diff is still reviewable
+  (roughly 800 lines, no high-risk boundary crossed mid-way); fusing every
+  dependent pair collapses a batch into one unreviewable PR, which fails the MSP
+  definition from the other direction.
 
-**State the consequence plainly:** a batch containing a deferred cross-MSP
-dependency is not fully dispatched in one run. That is the price of "nothing
-ever waits," and it is charged at plan time where it is visible, rather than as
-a scheduler that can stall.
+So the batch completes in one run, and the only thing that ever waits is an MSP
+whose producer is genuinely still building.
 
 ## Tiering: add complexity as a second axis
 
@@ -196,17 +200,18 @@ then wave N+1 starts. fanout's own docstring already calls it the lesser shape �
 land) instead of marching whole-wave barriers - wall-clock tracks the critical
 path, not the sum of per-wave slowest items."
 
-v2 goes further and removes scheduling from the model altogether. Because a
-cluster is a **connected component** of the dependency graph, every dependency
-edge lies *inside* some cluster. Clusters are therefore independent by
-construction:
+v2 keeps **edges** and drops **barriers**. The distinction is the whole point:
+a barrier makes an item wait on unrelated slow neighbours; an edge makes it wait
+only on its actual predecessor.
 
-- every cluster starts immediately;
-- nothing ever waits on another cluster;
-- when the last cluster returns, the batch is complete.
+Inside an MSP there are no edges left to wait on at all. Because a cluster is a
+**connected component** of the dependency graph, every intra-MSP dependency lies
+*inside* some cluster, so all of an MSP's clusters start at once and the MSP is
+done when the last returns.
 
-Dispatch is "spawn one agent per cluster, wait for all." There is no scheduler
-state, no barrier, no readiness check.
+Between MSPs, a real dependency stays an edge: B dispatches when A's build
+completes, and nothing else in the batch waits with it (see "Cross-MSP
+dependencies").
 
 **The cost, stated plainly.** A diamond — `A→B`, `A→C`, `B+C→D` — falls entirely
 into one component, so one agent walks it sequentially and the `B`/`C`
@@ -222,13 +227,12 @@ and fanout does not merge.
 
 - **`waves` is removed.** It described a barrier that v2 has no way to express
   and no reason to want. Nothing emits it, nothing reads it.
-- **`ready_after` survives with a smaller job.** Between clusters it would
-  always be empty, so it is no longer a schedule. It becomes the **order inside
-  a cluster** — the sequence handed to the owning agent so it knows which leaf
-  to build first and which depends on what it just finished.
+- **`ready_after` survives, at two granularities.** Inside a cluster it is the
+  sequence handed to the owning agent, so it knows which leaf to build first.
+  Between MSPs it is the dispatch edge — B starts when A's build completes.
+  Within an MSP it is always empty, because those edges live inside clusters.
 
-So the only ordering left in the system is ordering *within one agent's own
-work*. Nothing in v2 waits on anything.
+So ordering exists exactly where a real dependency exists, and nowhere else.
 
 ## Item schema
 
