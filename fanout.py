@@ -114,19 +114,24 @@ def msp_items(items):
     def union(a, b):
         parent[find(a)] = find(b)
 
-    owner, group_owner = {}, {}
+    owner, group_owner, msp_owner = {}, {}, {}
     for it in items:
         for f in it["files"]:
             if f in owner:
                 union(it["name"], owner[f])
             else:
                 owner[f] = it["name"]
-        g = it.get("contract_group")
-        if g:
-            if g in group_owner:
-                union(it["name"], group_owner[g])
-            else:
-                group_owner[g] = it["name"]
+        for key, seen in ((it.get("contract_group"), group_owner),
+                          # a declared `msp` is recon saying "these ship as one
+                          # PR" for a reason no file overlap can show - a feature
+                          # and its docs. Honoured as a MERGE only: it can fuse
+                          # leaves, never split ones that collide.
+                          (it.get("msp"), msp_owner)):
+            if key:
+                if key in seen:
+                    union(it["name"], seen[key])
+                else:
+                    seen[key] = it["name"]
     groups = defaultdict(list)
     for it in items:
         groups[find(it["name"])].append(it["name"])
@@ -1141,6 +1146,75 @@ def run_recon(asks, exec_template, concurrency=4, cwd=None, poll=0.2,
     return items, report
 
 
+def _git(args, cwd=None, check=True):
+    proc = subprocess.run(["git"] + list(args), cwd=cwd, capture_output=True,
+                          text=True)
+    if check and proc.returncode != 0:
+        raise RuntimeError("git %s failed: %s" % (" ".join(args),
+                                                  (proc.stderr or "").strip()))
+    return proc.stdout.strip()
+
+
+def _slug(name):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-").lower() or "msp"
+
+
+def prepare_worktrees(msps, base, root, repo=None, prefix="fanout/"):
+    """One git worktree per MSP, each on its own branch off `base`.
+
+    Parallel MSPs cannot share a working tree once they are on separate
+    branches, and one branch per MSP is what makes one PR per MSP possible. The
+    clusters INSIDE an MSP do share its tree - they are file-disjoint by
+    construction, which is the property the whole plan is built on.
+
+    Returns {msp index: {"path", "branch"}}."""
+    os.makedirs(root, exist_ok=True)
+    out = {}
+    for i, members in enumerate(msps):
+        label = _slug(members[0] if len(members) == 1 else "msp-%d" % i)
+        branch, path = prefix + label, os.path.join(root, label)
+        if not os.path.exists(path):
+            _git(["worktree", "add", "-b", branch, path, base], cwd=repo)
+        out[i] = {"path": path, "branch": branch, "label": label}
+    return out
+
+
+def finish_msp(tree, members, pr_template=None, repo=None, base="main",
+               push_remote="origin"):
+    """Commit an MSP's work, push its branch, and hand it to `--pr-exec`.
+
+    Runs only when every cluster of the MSP succeeded - a failed cluster blocks
+    its MSP, so a half-built MSP never reaches here and never opens a PR.
+    Opening the PR is a shell-out: the auth, the template and the host are the
+    caller's, and fanout holds none of them."""
+    path = tree["path"]
+    if not _git(["status", "--porcelain"], cwd=path, check=False):
+        return {"msp": tree["label"], "status": "no-changes"}
+    _git(["add", "-A"], cwd=path)
+    title = "%s: %s" % ("feat" if len(members) > 1 else "change",
+                        ", ".join(members[:3]))
+    _git(["commit", "-q", "-m", title], cwd=path)
+    result = {"msp": tree["label"], "branch": tree["branch"], "status": "committed",
+              "sha": _git(["rev-parse", "HEAD"], cwd=path)}
+    if push_remote:
+        push = subprocess.run(["git", "push", "-u", push_remote, tree["branch"]],
+                              cwd=path, capture_output=True, text=True)
+        result["pushed"] = push.returncode == 0
+        if push.returncode != 0:
+            result["push_error"] = (push.stderr or "").strip()[:400]
+            return result
+    if pr_template:
+        argv = shlex.split(pr_template)
+        argv = [a.replace("{branch}", tree["branch"]).replace("{base}", base)
+                 .replace("{title}", title)
+                 .replace("{items}", ", ".join(members)) for a in argv]
+        pr = subprocess.run(argv, cwd=path, capture_output=True, text=True)
+        result["pr_exit"] = pr.returncode
+        result["pr_output"] = (pr.stdout or pr.stderr or "").strip()[:400]
+        result["status"] = "pr-opened" if pr.returncode == 0 else "pr-failed"
+    return result
+
+
 def cluster_order(clusters, edges, items):
     """Dispatch priority: whatever unblocks the most work goes first.
 
@@ -1262,7 +1336,9 @@ def load_state(run_dir):
 
 def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
              prompt_template=None, cwd=None, poll=0.2, run_dir=None,
-             resume=False, max_output=4000, contract=RETURN_CONTRACT):
+             resume=False, max_output=4000, contract=RETURN_CONTRACT,
+             base=None, worktree_root=None, pr_template=None,
+             push_remote="origin", branches=True):
     """Dispatch ONE AGENT PER CLUSTER, unlocking dependents as each finishes.
 
     The cluster is the unit of work: an agent owns its leaves and walks them in
@@ -1295,6 +1371,28 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
 
     briefs = {b["cluster"]: b.get("prompt")
               for b in plan_obj.get("cluster_briefs", []) if b.get("prompt")}
+
+    # One branch per MSP is not an option, it is what "one MSP = one PR" MEANS.
+    # Parallel MSPs cannot share a working tree once they are on different
+    # branches, so each gets a worktree; the clusters inside an MSP share it,
+    # which is safe because they are file-disjoint by construction.
+    msps = plan_obj.get("msps") or [[it["name"]] for it in items]
+    msp_of = {n: i for i, g in enumerate(msps) for n in g}
+    cluster_msp = {i: msp_of.get(m[0], 0) for i, m in enumerate(clusters)}
+    trees, msp_results = {}, []
+    if branches and not dry_run and exec_template:
+        try:
+            repo_root = _git(["rev-parse", "--show-toplevel"], cwd=cwd)
+            ref = base or _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd)
+            trees = prepare_worktrees(msps, ref, worktree_root or
+                                      os.path.join(repo_root, ".fanout", "trees"),
+                                      repo=cwd)
+        except (RuntimeError, OSError) as exc:
+            # Not a git repo, or worktrees unavailable: run in one shared tree
+            # and SAY so, rather than silently producing no branches and no PRs.
+            msp_results.append({"status": "no-branches", "reason": str(exc)[:200]})
+            trees = {}
+
     pending = cluster_order(clusters, edges, items)
     status, running, records = {}, {}, []
 
@@ -1354,6 +1452,16 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
             records.append(record)
             state["items"][label(i)] = record
             _write_state(run_dir, state)
+            m = cluster_msp.get(i)
+            if m in trees and all(status.get(c) == "ok"
+                                  for c, mm in cluster_msp.items() if mm == m):
+                try:
+                    msp_results.append(finish_msp(trees[m], msps[m], pr_template,
+                                                  cwd, base or "HEAD", push_remote))
+                except (RuntimeError, OSError) as exc:
+                    msp_results.append({"msp": trees[m]["label"],
+                                        "status": "finish-failed",
+                                        "error": str(exc)[:300]})
         for i in [i for i in pending if doomed(i)]:
             pending.remove(i)
             status[i] = "blocked"
@@ -1385,12 +1493,15 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
             else:
                 files = sorted({f for n in members
                                 for f in by_name.get(n, {}).get("files", [])})
+                tree = trees.get(cluster_msp.get(nxt))
+                work_cwd = tree["path"] if tree else cwd
                 # Output goes to a FILE, never to the caller's stream: a worker that
                 # decides to narrate must not be able to flood whoever is watching.
                 # A worker needs to know which cluster it IS to satisfy the return
                 # contract; that is in the prompt, but a non-LLM worker (a script,
                 # a wrapper) should not have to parse prose to find it.
-                env = dict(os.environ, FANOUT_CLUSTER=label(nxt),
+                env = dict(os.environ, FANOUT_BRANCH=(tree or {}).get("branch", ""),
+                           FANOUT_CLUSTER=label(nxt),
                            FANOUT_ITEM=members[0], FANOUT_ITEMS=",".join(members),
                            FANOUT_PLAN_ID=pid, FANOUT_TIER=cluster_tier(nxt),
                            FANOUT_FILES=",".join(files))
@@ -1400,10 +1511,10 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
                                             "%s.out" % _safe(label(nxt))),
                                "w", encoding="utf-8")
                     handles = [out]
-                    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out,
+                    proc = subprocess.Popen(argv, cwd=work_cwd, env=env, stdout=out,
                                             stderr=subprocess.STDOUT)
                 else:
-                    proc = subprocess.Popen(argv, cwd=cwd, env=env)
+                    proc = subprocess.Popen(argv, cwd=work_cwd, env=env)
                 running[nxt] = (proc, time.time(), handles)
         if running:
             if not dry_run:
@@ -1421,6 +1532,8 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
     _write_state(run_dir, state)
     result = {"plan_id": pid, "concurrency": concurrency,
               "dispatched": records, "summary": dict(counts)}
+    if msp_results:
+        result["msps"] = msp_results
     if run_dir:
         result["run_dir"] = run_dir
     return result
@@ -1484,6 +1597,27 @@ def main():
                          "them when you only want the shape of the plan: each "
                          "one carries a full prompt, so they dominate the "
                          "output on a wide batch.")
+    ap.add_argument("--base", default=None,
+                    help="ref the MSP branches are cut from (default: the "
+                         "current branch). One branch per MSP is not optional - "
+                         "it is what 'one MSP = one PR' means - so --exec always "
+                         "creates them, one worktree each.")
+    ap.add_argument("--pr-exec", dest="pr_template", default=None,
+                    help="command run once per MSP after its LAST cluster "
+                         "succeeds and its branch is pushed, e.g. "
+                         "'gh pr create --draft --base {base} --head {branch} "
+                         "--title {title}'. A failed cluster blocks its MSP, so a "
+                         "half-built MSP never reaches this. Placeholders: "
+                         "{branch} {base} {title} {items}.")
+    ap.add_argument("--worktree-root", default=None,
+                    help="where the per-MSP worktrees go (default "
+                         ".fanout/trees under the repo root)")
+    ap.add_argument("--no-push", action="store_true",
+                    help="commit each MSP branch but do not push it (no PR)")
+    ap.add_argument("--no-branches", action="store_true",
+                    help="escape hatch: run every cluster in ONE working tree "
+                         "with no branches and no PRs. Only for a scratch repo "
+                         "or a non-git directory.")
     ap.add_argument("--concurrency", type=int, default=4,
                     help="most items dispatched at once (default 4)")
     ap.add_argument("--dry-run", action="store_true",
@@ -1565,7 +1699,11 @@ def main():
     result = run_plan(computed, items, args.exec_template, args.concurrency,
                       args.dry_run, args.prompt_template, run_dir=run_dir,
                       resume=args.resume, max_output=args.max_output_bytes,
-                      contract=None if args.no_return_contract else RETURN_CONTRACT)
+                      contract=None if args.no_return_contract else RETURN_CONTRACT,
+                      base=args.base, worktree_root=args.worktree_root,
+                      pr_template=args.pr_template,
+                      push_remote=None if args.no_push else "origin",
+                      branches=not args.no_branches)
     if args.run_log:
         with open(args.run_log, "w", encoding="utf-8") as f:
             for record in result["dispatched"]:

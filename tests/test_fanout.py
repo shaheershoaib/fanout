@@ -2,6 +2,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -822,6 +823,84 @@ class ClusterBriefs(unittest.TestCase):
         msps = {b["msp"] for b in pl["cluster_briefs"]}
         self.assertEqual(len(msps), 1)        # three clusters, one MSP, one PR
         self.assertEqual(len(pl["cluster_briefs"]), 3)
+
+
+class BranchPerMSP(unittest.TestCase):
+    """One branch per MSP is what "one MSP = one PR" means, so --exec does it
+    without being asked."""
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self._g(["init", "-q", "-b", "main", "."])
+        for path in ("api/x.py", "web/y.tsx", "docs/d.md"):
+            full = os.path.join(self.repo, path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            open(full, "w").write("seed\n")
+        self._g(["add", "-A"])
+        self._g(["-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-qm", "init"])
+        self.worker = os.path.join(self.repo, "w.py")
+        open(self.worker, "w").write(
+            "import os, json, pathlib\n"
+            "for f in os.environ.get('FANOUT_FILES','').split(','):\n"
+            "    if f:\n"
+            "        p = pathlib.Path(f); p.parent.mkdir(parents=True, exist_ok=True)\n"
+            "        p.write_text('edited\\n')\n"
+            "print(json.dumps({'item': os.environ['FANOUT_CLUSTER'],"
+            " 'status':'ok', 'files_changed': [], 'notes':'d'}))\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.repo, ignore_errors=True)
+
+    def _g(self, args):
+        return subprocess.run(["git"] + args, cwd=self.repo,
+                              capture_output=True, text=True)
+
+    def _run(self, items, **kw):
+        pl = fp.plan(items, None, [], trajectories=[])
+        return pl, fp.run_plan(pl, items, "%s %s" % (sys.executable, self.worker),
+                               cwd=self.repo, push_remote=None, **kw)
+
+    def test_each_msp_gets_its_own_branch_and_worktree(self):
+        items = [{"name": "a", "files": ["api/x.py"], "task": "t"},
+                 {"name": "b", "files": ["web/y.tsx"], "task": "t"}]
+        _, res = self._run(items)
+        branches = self._g(["branch", "--list", "fanout/*"]).stdout
+        self.assertIn("fanout/a", branches)
+        self.assertIn("fanout/b", branches)
+        self.assertEqual(len(res["msps"]), 2)
+        for m in res["msps"]:
+            self.assertEqual(m["status"], "committed")
+
+    def test_clusters_of_one_msp_share_that_msps_tree(self):
+        items = [{"name": "a", "files": ["api/x.py"], "task": "t"},
+                 {"name": "b", "files": ["docs/d.md"], "task": "t", "msp": "bundle"},
+                 {"name": "c", "files": ["api/x.py"], "task": "t", "msp": "bundle"}]
+        pl, res = self._run(items)
+        self.assertEqual(len(pl["msps"]), 1)          # `msp` field fused them
+        self.assertEqual(len(res["msps"]), 1)         # one branch, one PR
+        self.assertGreater(len(pl["clusters"]), 1)    # still parallel inside
+
+    def test_a_failed_cluster_stops_its_msp_from_opening_a_pr(self):
+        items = [{"name": "a", "files": ["api/x.py"], "task": "t"},
+                 {"name": "b", "files": ["web/y.tsx"], "task": "t"}]
+        pl = fp.plan(items, None, [], trajectories=[])
+        res = fp.run_plan(pl, items, "false", cwd=self.repo, push_remote=None)
+        self.assertEqual(res.get("msps", []), [])     # nothing committed
+        self.assertEqual(res["summary"].get("failed"), 2)
+
+    def test_no_branches_escape_hatch_uses_one_tree(self):
+        items = [{"name": "a", "files": ["api/x.py"], "task": "t"}]
+        _, res = self._run(items, branches=False)
+        self.assertNotIn("msps", res)
+        self.assertEqual(self._g(["branch", "--list", "fanout/*"]).stdout.strip(), "")
+
+    def test_declared_msp_can_only_merge_never_split(self):
+        """Two leaves sharing a file stay one MSP even when recon labels them
+        differently - a wrong label must not be able to break merge safety."""
+        items = [{"name": "a", "files": ["api/x.py"], "msp": "one"},
+                 {"name": "b", "files": ["api/x.py"], "msp": "two"}]
+        self.assertEqual(len(fp.msp_items(items)), 1)
 
 if __name__ == "__main__":
     unittest.main()

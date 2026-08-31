@@ -55,6 +55,20 @@ identical in a transcript and loses the whole speed win. `--exec` dispatches it:
 
 `... --exec 'claude -p {prompt}' --concurrency 4 [--dry-run] [--run-log run.jsonl]`
 
+**One branch per MSP is not a flag - it is what "one MSP = one PR" means.**
+`--exec` cuts a branch and a git worktree for every MSP off `--base` (default:
+the current branch), and dispatches that MSP's clusters inside it. The clusters
+of one MSP share its tree, which is safe because they are file-disjoint by
+construction. When an MSP's LAST cluster succeeds, its work is committed,
+pushed, and handed to `--pr-exec`:
+
+`--pr-exec 'gh pr create --draft --base {base} --head {branch} --title {title}'`
+
+A failed cluster blocks its MSP, so a half-built MSP never commits and never
+opens a PR. `--no-push` commits without pushing; `--no-branches` is an escape
+hatch for a scratch repo or a non-git directory, and it is reported in the
+result rather than silently producing no branches.
+
 It dispatches **one agent per CLUSTER**, not per item - the cluster is the unit
 one agent owns, and everything that must serialize is already inside it. A
 cluster with no `cluster_after` edge starts immediately whatever MSP it belongs
