@@ -39,9 +39,23 @@ identical in a transcript and loses the whole speed win. `--exec` dispatches it:
 
 `... --exec 'claude -p {prompt}' --concurrency 4 [--dry-run] [--run-log run.jsonl]`
 
-It walks `ready_after`: every item whose predecessors SUCCEEDED is dispatched, up
-to `--concurrency` at once, unlocking dependents as each finishes. Order follows
-the plan, so long poles go first. Because same-wave items are file-disjoint by
+It dispatches **one agent per CLUSTER**, not per item - the cluster is the unit
+one agent owns, and everything that must serialize is already inside it. A
+cluster with no `cluster_after` edge starts immediately whatever MSP it belongs
+to; one with an edge starts the moment ITS producer finishes, never when an
+unrelated slow neighbour does. Priority goes to whatever unblocks the most work.
+
+Each agent receives its cluster as a JSON brief - the leaves in dependency
+order, and per leaf: `task`, `edit`, `read`, `acceptance`, and `file_notes` when
+the item supplies them. It is JSON rather than prose so a non-LLM worker can
+consume the same dispatch. A multi-leaf cluster is told to walk its leaves in
+order and to emit one contract line per leaf; those land in `returns`, while
+`returned` keeps its old single-line shape.
+
+**`task` is what tells the agent what to DO, and it comes from the item.** An
+item without one dispatches an agent whose entire brief is a name, so the plan
+lists those under `underspecified` rather than letting the run look normal while
+the work is guesswork. Because same-wave items are file-disjoint by
 construction, one shared working tree is safe - worktrees only matter if you want
 per-item commits.
 

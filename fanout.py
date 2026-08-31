@@ -803,6 +803,13 @@ def plan(items, graph_path, risk_markers, trajectories=None,
                                                     deps))):
         if value:  # omit empty sections rather than pad the plan
             result[key] = value
+    # An item with no `task` dispatches an agent whose entire brief is a NAME.
+    # That is a plan defect, and a silent one - the run looks normal and the
+    # work is guesswork. Name them so the caller fixes the items, not the plan.
+    thin = sorted(it["name"] for it in items
+                  if not (it.get("task") or it.get("text")))
+    if thin:
+        result["underspecified"] = thin
     result["plan_id"] = plan_id(result)
     return result
 
@@ -934,6 +941,106 @@ def parse_return(text):
     return None
 
 
+def parse_returns(text):
+    """Every structured line a worker produced, oldest first.
+
+    A cluster agent owns SEVERAL leaves and reports one line each, so the
+    single-line reader is not enough. Kept separate from `parse_return` rather
+    than changing its return type, because callers depend on that shape."""
+    out = []
+    for line in (text or "").strip().splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                out.append(parsed)
+    return out
+
+
+def cluster_order(clusters, edges, items):
+    """Dispatch priority: whatever unblocks the most work goes first.
+
+    Ranked by how many clusters wait on it (transitively), then by size. A
+    cluster nothing depends on can start any time; one that three others are
+    waiting for should not be sitting in the queue behind it."""
+    cost = {it["name"]: item_cost(it) for it in items}
+    waiters = defaultdict(set)
+    for cid, deps in (edges or {}).items():
+        for d in deps:
+            waiters[int(d)].add(int(cid))
+    # transitive: a cluster also unblocks whatever ITS waiters unblock
+    def downstream(i, seen=None):
+        seen = seen if seen is not None else set()
+        for w in waiters.get(i, ()):
+            if w not in seen:
+                seen.add(w)
+                downstream(w, seen)
+        return seen
+    ranked = sorted(
+        range(len(clusters)),
+        key=lambda i: (-len(downstream(i)),
+                       -sum(cost.get(n, 1) for n in clusters[i]), i))
+    return ranked
+
+
+def render_cluster_prompt(members, by_name, packs, tier, order,
+                          template=None, contract=None):
+    """The self-contained brief for ONE cluster - the JSON spec the agent works
+    from.
+
+    A cluster is the unit one agent owns: it may hold several leaves, and it
+    walks them in `order` because a later leaf can depend on an earlier one. A
+    spawned process inherits no conversation, so the whole brief has to be here.
+    The leaf list is emitted as JSON rather than prose so a non-LLM worker (a
+    script, a wrapper) can consume the same dispatch."""
+    seq = [n for n in order if n in members] + [n for n in members if n not in order]
+    leaves = []
+    for n in seq:
+        item = by_name.get(n, {"name": n, "files": []})
+        pack = packs.get(n, {})
+        edit = pack.get("edit") or item.get("files", [])
+        leaf = {"name": n,
+                "task": item.get("task") or item.get("text") or n,
+                "edit": edit,
+                "read": pack.get("read", [])}
+        if item.get("acceptance"):
+            leaf["acceptance"] = item["acceptance"]
+        # Per-file intent, when recon supplied it. `edit` says WHICH files; for a
+        # leaf spanning more than a couple, that leaves the agent to infer what
+        # each one is for. Recon already looked at them, so it can say.
+        notes = {f: v for f, v in (item.get("file_notes") or {}).items() if f in edit}
+        if notes:
+            leaf["file_notes"] = notes
+        leaves.append(leaf)
+    spec = json.dumps({"leaves": leaves}, indent=2)
+    if template:
+        for key, val in (("{cluster}", ", ".join(seq)), ("{spec}", spec),
+                         ("{tier}", tier), ("{contract}", contract or "")):
+            template = template.replace(key, val)
+        return template
+    lines = []
+    if len(seq) == 1:
+        lines.append("Task: " + leaves[0]["task"])
+    else:
+        lines.append("You own %d related pieces of work. Do them IN THE ORDER "
+                     "GIVEN - a later one may build on an earlier one." % len(seq))
+    lines.append("")
+    lines.append(spec)
+    lines.append("")
+    lines.append("Edit ONLY the files listed under `edit`. Other agents are "
+                 "working in this tree RIGHT NOW on disjoint files; touching "
+                 "anything outside your edit lists will collide with them.")
+    if contract:
+        lines.append("")
+        if len(seq) > 1:
+            lines.append("Emit ONE such line PER LEAF, in order:")
+        lines.append(contract)
+    return "\n".join(lines)
+
+
 def build_argv(exec_template, prompt, item):
     """argv WITHOUT a shell: split the template FIRST, then substitute into the
     resulting tokens, so a prompt containing quotes, newlines, backticks or
@@ -975,23 +1082,38 @@ def load_state(run_dir):
 def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
              prompt_template=None, cwd=None, poll=0.2, run_dir=None,
              resume=False, max_output=4000, contract=RETURN_CONTRACT):
-    """Dispatch every item whose predecessors have SUCCEEDED, up to `concurrency`
-    at once, unlocking dependents as each finishes - the `ready_after` DAG driven
-    directly, so nothing idles behind an unrelated slow neighbour. Dispatch order
-    follows the plan (waves are already priority-sorted), so long poles go first.
+    """Dispatch ONE AGENT PER CLUSTER, unlocking dependents as each finishes.
 
-    Same-wave items are file-DISJOINT by construction, so one shared working tree
-    is safe - worktrees are only needed if you want per-item commits.
+    The cluster is the unit of work: an agent owns its leaves and walks them in
+    order, because everything that must serialize is already inside one cluster.
+    So dispatch has no barrier - a cluster with no `cluster_after` edge starts
+    immediately whatever MSP it belongs to, and one with an edge starts the
+    moment ITS producer finishes, never when an unrelated slow neighbour does.
 
-    A non-zero exit marks an item `failed` and its dependents `blocked`; work
-    that does not depend on the failure keeps going. Nothing is ever recorded as
-    done because it was skipped."""
+    Priority goes to whatever unblocks the most work, so a cluster three others
+    wait on does not sit behind one nothing depends on.
+
+    A non-zero exit marks the cluster `failed` and its dependents `blocked`;
+    independent work keeps going. Nothing is recorded as done because it was
+    skipped."""
     by_name = {it["name"]: it for it in items}
-    deps = plan_obj.get("ready_after", {})
+    clusters = plan_obj.get("clusters") or [[it["name"]] for it in items]
+    edges = {int(k): [int(v) for v in vs]
+             for k, vs in (plan_obj.get("cluster_after") or {}).items()}
     packs, tier = plan_obj.get("context_packs", {}), plan_obj.get("tier", {})
-    pending = [n for w in plan_obj.get("waves", []) for n in w]
-    status, running, records = {}, {}, []
+    within = plan_obj.get("ready_after", {})
+    order = [n for w in plan_obj.get("waves", []) for n in w]
     pid = plan_obj.get("plan_id") or plan_id(plan_obj)
+
+    def label(i):
+        return clusters[i][0] if len(clusters[i]) == 1 else "cluster-%d" % i
+
+    def cluster_tier(i):
+        # the riskiest leaf sets the cluster's tier: one agent does all of them
+        return "top" if any(tier.get(n) == "top" for n in clusters[i]) else "cheap"
+
+    pending = cluster_order(clusters, edges, items)
+    status, running, records = {}, {}, []
 
     state = {"plan_id": pid, "items": {}}
     if run_dir and not dry_run:
@@ -1005,75 +1127,91 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
                                  "work-set changed, so prior results do not apply"
                                  % (prior.get("plan_id"), pid))
             state["items"] = prior.get("items", {})
-            done = [n for n, r in state["items"].items() if r.get("status") == "ok"]
-            for n in done:
-                if n in pending:
-                    pending.remove(n)
-                status[n] = "ok"
-                records.append({"item": n, "status": "resumed", "exit": 0})
+            for i in list(pending):
+                if state["items"].get(label(i), {}).get("status") == "ok":
+                    pending.remove(i)
+                    status[i] = "ok"
+                    records.append({"item": label(i), "cluster": label(i),
+                                    "status": "resumed", "exit": 0})
 
-    def ok(n):
-        return all(status.get(d) == "ok" for d in deps.get(n, []))
+    def ok(i):
+        return all(status.get(d) == "ok" for d in edges.get(i, []))
 
-    def doomed(n):
-        return any(status.get(d) in ("failed", "blocked") for d in deps.get(n, []))
+    def doomed(i):
+        return any(status.get(d) in ("failed", "blocked") for d in edges.get(i, []))
 
     while pending or running:
-        for name in [n for n, (p, _, _) in running.items() if p.poll() is not None]:
-            proc, started, handles = running.pop(name)
+        for i in [i for i, (p, _, _) in running.items() if p.poll() is not None]:
+            proc, started, handles = running.pop(i)
             for h in handles:
                 h.close()
-            status[name] = "ok" if proc.returncode == 0 else "failed"
-            record = {"item": name, "status": status[name], "exit": proc.returncode,
+            status[i] = "ok" if proc.returncode == 0 else "failed"
+            record = {"item": label(i), "cluster": label(i), "items": clusters[i],
+                      "tier": cluster_tier(i),
+                      "status": status[i], "exit": proc.returncode,
                       "seconds": round(time.time() - started, 2)}
             if run_dir:
-                out_path = os.path.join(run_dir, "items", "%s.out" % _safe(name))
+                out_path = os.path.join(run_dir, "items", "%s.out" % _safe(label(i)))
                 try:
                     with open(out_path, encoding="utf-8", errors="replace") as f:
                         text = f.read()
                 except OSError:
                     text = ""
-                returned = parse_return(text)
+                returned = parse_returns(text)
                 if returned:
-                    record["returned"] = returned      # the bounded, structured half
+                    # `returned` keeps its old shape - the last structured line -
+                    # so existing consumers are unaffected. A multi-leaf cluster
+                    # reports one line per leaf, and those go in `returns`.
+                    record["returned"] = returned[-1]
+                    if len(returned) > 1:
+                        record["returns"] = returned
                 record["output_file"] = out_path       # the unbounded half stays on disk
                 if not returned and text:
                     record["output_tail"] = text[-max_output:]
             records.append(record)
-            state["items"][name] = record
+            state["items"][label(i)] = record
             _write_state(run_dir, state)
-        for n in [n for n in pending if doomed(n)]:
-            pending.remove(n)
-            status[n] = "blocked"
-            blocked = {"item": n, "status": "blocked",
-                       "reason": "a predecessor did not succeed"}
+        for i in [i for i in pending if doomed(i)]:
+            pending.remove(i)
+            status[i] = "blocked"
+            blocked = {"item": label(i), "cluster": label(i),
+                       "items": clusters[i], "status": "blocked",
+                       "reason": "a predecessor cluster did not succeed"}
             records.append(blocked)
-            state["items"][n] = blocked
+            state["items"][label(i)] = blocked
             _write_state(run_dir, state)
         while len(running) < concurrency:
-            nxt = next((n for n in pending if ok(n)), None)
+            nxt = next((i for i in pending if ok(i)), None)
             if nxt is None:
                 break
             pending.remove(nxt)
-            item = by_name.get(nxt) or {"name": nxt, "files": []}
-            prompt = render_prompt(item, packs.get(nxt, {}),
-                                   tier.get(nxt, "cheap"), prompt_template, contract)
-            argv = build_argv(exec_template, prompt, item)
+            members = clusters[nxt]
+            prompt = render_cluster_prompt(members, by_name, packs,
+                                           cluster_tier(nxt), order,
+                                           prompt_template, contract)
+            head = by_name.get(members[0], {"name": members[0], "files": []})
+            argv = build_argv(exec_template, prompt, head)
             if dry_run:
                 status[nxt] = "ok"
-                records.append({"item": nxt, "status": "dry-run", "argv": argv})
+                records.append({"item": label(nxt), "cluster": label(nxt),
+                                "items": members, "tier": cluster_tier(nxt),
+                                "status": "dry-run", "argv": argv})
             else:
+                files = sorted({f for n in members
+                                for f in by_name.get(n, {}).get("files", [])})
                 # Output goes to a FILE, never to the caller's stream: a worker that
                 # decides to narrate must not be able to flood whoever is watching.
-                # A worker needs to know which item it IS to satisfy the return
-                # contract; the name is in the prompt, but a non-LLM worker (a
-                # script, a wrapper) should not have to parse prose to find it.
-                env = dict(os.environ, FANOUT_ITEM=nxt, FANOUT_PLAN_ID=pid,
-                           FANOUT_TIER=tier.get(nxt, "cheap"),
-                           FANOUT_FILES=",".join(item.get("files", [])))
+                # A worker needs to know which cluster it IS to satisfy the return
+                # contract; that is in the prompt, but a non-LLM worker (a script,
+                # a wrapper) should not have to parse prose to find it.
+                env = dict(os.environ, FANOUT_CLUSTER=label(nxt),
+                           FANOUT_ITEM=members[0], FANOUT_ITEMS=",".join(members),
+                           FANOUT_PLAN_ID=pid, FANOUT_TIER=cluster_tier(nxt),
+                           FANOUT_FILES=",".join(files))
                 handles = []
                 if run_dir:
-                    out = open(os.path.join(run_dir, "items", "%s.out" % _safe(nxt)),
+                    out = open(os.path.join(run_dir, "items",
+                                            "%s.out" % _safe(label(nxt))),
                                "w", encoding="utf-8")
                     handles = [out]
                     proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out,
@@ -1084,10 +1222,11 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
         if running:
             if not dry_run:
                 time.sleep(poll)
-        elif pending and not any(ok(n) for n in pending):
-            for n in pending:  # unreachable deps: say so, never silently drop
-                status[n] = "blocked"
-                records.append({"item": n, "status": "blocked",
+        elif pending and not any(ok(i) for i in pending):
+            for i in pending:  # unreachable deps: say so, never silently drop
+                status[i] = "blocked"
+                records.append({"item": label(i), "cluster": label(i),
+                                "items": clusters[i], "status": "blocked",
                                 "reason": "dependencies can no longer be satisfied"})
             pending = []
     counts = defaultdict(int)
