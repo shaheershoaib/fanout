@@ -60,7 +60,7 @@ flowchart TB
   S --> T["<b>tier</b><br/>blast radius × complexity"]
   T --> D["<b>dispatch</b><br/>one process per cluster"]
   D --> B["clusters converge<br/>into ONE branch per MSP"]
-  B --> P["<b>draft PR</b><br/><i>all clusters succeeded<br/>AND every receipt present</i>"]
+  B --> P["<b>draft PR</b><br/><i>all clusters succeeded AND<br/>every return contract's<br/>proof field non-empty</i>"]
   D --> C["<b>reconcile</b><br/>predicted vs actual files"]
 
   style R fill:#1f6feb22,stroke:#1f6feb
@@ -298,11 +298,16 @@ records completions as they land.
 An MSP opens its draft PR when **every** member cluster has:
 
 - `status: succeeded`, and
-- a non-empty `receipt` in its return contract.
+- a non-empty `receipt` in its return contract — the field the existing
+  `RETURN_CONTRACT` already defines as *"how you proved it works"*.
 
-Exit 0 means the agent finished, not that the work is right. Without the receipt
-condition, fanout opens PRs on unverified work — the exact failure the receipt
-exists to catch.
+Exit 0 means the agent finished, not that the work is right, so status alone is
+not enough to open a PR on someone's behalf.
+
+`receipt` here is that contract field and nothing more. fanout defines no
+verification standard, names no verification tool, and does not judge what a
+good proof looks like — it only refuses to open a PR when the field is empty.
+What belongs in it is entirely the caller's business.
 
 A failed cluster marks its dependents `blocked`, so its MSP never completes and
 never opens a PR. Partial work stays on the branch, the run-dir names the
