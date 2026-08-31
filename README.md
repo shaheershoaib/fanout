@@ -1,14 +1,21 @@
 # fanout
 
-Decide how a batch of coding tasks should run — what goes in parallel, what must
-serialize, in what order, at what cost — and then actually run it.
+Take a list of things you want built, work out what can run at once, and run it —
+one agent per unit of work, one branch and one draft PR per shippable change.
 
-JSON in, JSON out. Pure Python standard library: no dependencies, no network, no
-assumption about which agent or runtime you use.
+Pure Python standard library: no dependencies, no network, no assumption about
+which agent or runtime you use.
 
 ```bash
-python3 fanout.py --items items.json --risk-markers "auth/,billing/"
+python3 fanout.py --asks asks.txt \
+  --recon-exec 'your-agent-cli -p {prompt}' \
+  --exec 'your-agent-cli -p {prompt}' \
+  --base main --pr-exec 'gh pr create --draft --base {base} --head {branch} --title {title}'
 ```
+
+`asks.txt` is plain text, one request per line. Everything else — which files
+each one touches, what can run in parallel, who waits for whom, which model tier,
+what each agent is told — fanout works out.
 
 ## The problem
 
@@ -19,27 +26,47 @@ wait for it, and two tasks that look independent can still collide (both adding 
 sequentially-numbered migration to the same app, for instance).
 
 Guessing is slow when you are too cautious and corrupting when you are not.
-fanout computes the answer instead, deterministically, in milliseconds.
+fanout computes the answer instead — and the part that cannot be computed
+(reading "add a resolved filter" and working out which files that touches) it
+delegates to an agent, then computes everything downstream deterministically.
 
 ## What it computes
 
 ```mermaid
-flowchart LR
-  I["items.json<br/><i>name · files · after</i>"] --> C["<b>group</b><br/>shared file<br/>or contract"]
-  G[("graph.json<br/><i>optional</i>")] -. hints .-> C
-  C --> S["<b>schedule</b><br/>waves<br/>ready_after"]
-  S --> T["<b>tier</b><br/>risk markers<br/>+ history"]
-  T --> X["<b>--exec</b><br/>one process per item,<br/>walked along the DAG"]
-  X --> R[("run-dir<br/><i>state · resume · run-log</i>")]
+flowchart TB
+  A["asks.txt<br/><i>plain text, one per line</i>"] --> R["<b>recon</b><br/>one agent per ask<br/>graph → grep → structure"]
+  G[("graph.json<br/><i>optional</i>")] -. queried first .-> R
+  R --> I["<b>leaves</b><br/>task · files · complexity<br/>acceptance · file_notes"]
+  I --> M["<b>MSPs</b><br/>one branch, one PR"]
+  M --> C["<b>clusters</b><br/>what one agent owns"]
+  C --> T["<b>tier</b><br/>blast radius × complexity"]
+  T --> X["<b>--exec</b><br/>one agent per cluster"]
+  X --> P["<b>draft PR</b><br/>per MSP"]
 
+  style R fill:#bf872922,stroke:#bf8729
+  style M fill:#1f6feb22,stroke:#1f6feb
   style C fill:#1f6feb22,stroke:#1f6feb
-  style S fill:#1f6feb22,stroke:#1f6feb
-  style T fill:#1f6feb22,stroke:#1f6feb
+  style P fill:#2da44e22,stroke:#2da44e
 ```
 
-Everything left of `--exec` is deterministic and takes milliseconds. Nothing in
-this diagram touches git: fanout schedules and dispatches, and never commits,
-merges, gates or closes.
+Only the orange box is an LLM. Everything blue is deterministic and takes
+milliseconds — same inputs, same plan, and `plan_id` hashes it.
+
+Two units, and the difference matters:
+
+- an **MSP** is one shippable change: one branch, one PR. Two leaves that edit
+  the same file are forced into one MSP, because two open PRs must never touch
+  the same file.
+- a **cluster** is what one agent owns inside an MSP — leaves that must run in
+  sequence because they collide or depend on each other. Independent leaves are
+  clusters of one. Clusters run in parallel; a cluster with a dependency starts
+  when its producer finishes, and nothing else waits with it.
+
+There are no waves. A barrier would make a task wait on unrelated slow
+neighbours; an edge makes it wait only on its actual predecessor.
+
+If you already have items with their files worked out, skip recon and pass
+`--items items.json` instead.
 
 Give it the items and the files each one will edit:
 
@@ -56,10 +83,13 @@ It returns:
 
 | field | what it answers |
 |---|---|
-| `clusters` | which items MUST serialize (shared file or declared contract group) |
-| `waves` | a barrier schedule: everything in a wave runs concurrently |
-| `ready_after` | the real dependency DAG — pipeline off this, not the waves |
-| `tier` | per item, `top` or `cheap`, so you can route models by risk |
+| `msps` | which leaves ship together — one MSP is one branch and one PR |
+| `clusters` | what one agent owns: leaves that must run in sequence |
+| `cluster_after` | which clusters wait on which, carried per cluster, never per MSP |
+| `cluster_briefs` | **what each agent must be told** — leaves, files, tasks, acceptance, and a ready-to-send prompt |
+| `tier` | per item, `top` or `cheap`, from blast radius × complexity |
+| `underspecified` | leaves with no task — an agent whose whole brief is a name |
+| `waves`, `ready_after` | legacy schedule fields; dispatch off clusters instead |
 | `context_packs` | the files each task should read, so an agent is not left hunting |
 | `coupling_review` | file-disjoint pairs that still carry a coupling signal |
 | `verdict_groups` | those pairs bucketed, so one ruling covers many |
@@ -84,12 +114,24 @@ python3 fanout.py --items items.json \
   --exec 'your-agent-cli --prompt {prompt}' --concurrency 4
 ```
 
-It walks the dependency DAG: every item whose predecessors succeeded is
-dispatched, up to the concurrency cap, unlocking dependents as each finishes.
-Longest chains go first, so the critical path is not left until last.
+It dispatches **one agent per cluster**, up to the concurrency cap. A cluster
+with no dependency starts immediately; one with a dependency starts the moment
+its producer finishes. Priority goes to whatever unblocks the most work.
 
-- Same-wave items are file-disjoint by construction, so **one shared working tree
-  is safe** — no worktree ceremony unless you want per-item commits.
+Each agent gets its cluster as a JSON brief — its leaves in order, and per leaf
+the task, the files to edit, what to read for context, the acceptance line, and
+per-file notes. That brief is in the plan as `cluster_briefs`, so if you would
+rather spawn the agents yourself, you send exactly what `--exec` would.
+
+**One branch per MSP is not optional** — it is what "one MSP, one PR" means. Each
+MSP gets a git worktree on its own branch off `--base`; its clusters share that
+tree, which is safe because they are file-disjoint by construction. When an MSP's
+last cluster succeeds, its work is committed, pushed, and handed to `--pr-exec`.
+A failed cluster blocks its MSP, so a half-built MSP never commits and never
+opens a PR.
+
+- `--no-push` commits without pushing; `--no-branches` runs everything in one
+  tree, for a scratch or non-git directory.
 - The command template is split into argv **before** substitution, so a prompt
   containing quotes, newlines or `;` can never be reinterpreted as shell syntax.
 - A failure marks its dependents `blocked` and exits non-zero. A green exit is
@@ -100,13 +142,41 @@ Because dispatch is a subprocess concern, this works with an agent runtime that
 has **no subagent primitive of its own** — the thing that otherwise forces a
 capable planner back into single-file execution.
 
+## What fanout does not do
+
+It stops at open draft PRs. Reviewing the diff, deciding to merge, confirming the
+deploy, and checking the change did what was asked are all somebody else's.
+
+That line is deliberate. Everything fanout does is mechanical and re-runnable
+from the same inputs; everything past it is judgement about whether the work is
+right, which is not a scheduling problem. Merge especially: a scheduler that can
+merge is a scheduler that can merge something wrong.
+
+## The honest caveat
+
+Merge safety rests on the files recon PREDICTED. Recon is an agent, so that is a
+judgement, not a fact — and an under-predicted file list is the one error that
+breaks a plan rather than slowing it.
+
+So the guarantee is conditional and says so: **the plan is safe if recon was
+right, and you are told when it was not.** After a run, `reconcile()` compares
+predicted files against what each cluster actually changed. A surprise inside an
+MSP is noise; one that lands in another MSP's files means those two were not
+disjoint and the plan ran a real collision in parallel.
+
+Read `--emit-items` before dispatching if the batch is expensive. It writes what
+recon derived so you can correct it before anything is built.
+
 ## Optional inputs
 
 - `--graph` — a [graphify](https://github.com/shaheershoaib) `graph.json`. Adds
   import-adjacency coupling signals and fills in `context_packs` neighbours.
   Without it everything else still computes.
-- `--risk-markers` — path substrings that force the `top` tier. **You** supply
-  these; the tool bakes in no paths and knows nothing about your domain.
+- `--risk-markers` — paths that force the `top` tier. **You** supply these; the
+  tool bakes in no paths and knows nothing about your domain. A plain marker
+  matches a *word* of the path, case-insensitively, so `auth` matches
+  `types/AuthResponse.ts` and `app/auth/route.ts` but not `(unauthenticated)`. A
+  marker containing a separator (`api/auth`, `.sql`) is read as a path fragment.
 - `--serial-verify-markers` — surfaces whose verification needs a real session.
 - `--trajectories` — a JSONL history store, if you keep one. Strictly additive:
   history only ever raises caution, never relaxes it. Override the default path
