@@ -62,6 +62,10 @@ Two units, and the difference matters:
   clusters of one. Clusters run in parallel; a cluster with a dependency starts
   when its producer finishes, and nothing else waits with it.
 
+A cluster never spans two MSPs, since it converges into one branch. So a
+dependency between MSPs stays a dispatch **edge** — the consumer waits for the
+producer's build, and nothing is merged into one agent behind your back.
+
 There are no waves. A barrier would make a task wait on unrelated slow
 neighbours; an edge makes it wait only on its actual predecessor.
 
@@ -87,7 +91,7 @@ It returns:
 | `clusters` | what one agent owns: leaves that must run in sequence |
 | `cluster_after` | which clusters wait on which, carried per cluster, never per MSP |
 | `cluster_briefs` | **what each agent must be told** — leaves, files, tasks, acceptance, and a ready-to-send prompt |
-| `tier` | per item, `top` or `cheap`, from blast radius × complexity |
+| `tier` | per item, `top` or `cheap`, from blast radius × complexity — route models off this |
 | `underspecified` | leaves with no task — an agent whose whole brief is a name |
 | `waves`, `ready_after` | legacy schedule fields; dispatch off clusters instead |
 | `context_packs` | the files each task should read, so an agent is not left hunting |
@@ -129,6 +133,21 @@ tree, which is safe because they are file-disjoint by construction. When an MSP'
 last cluster succeeds, its work is committed, pushed, and handed to `--pr-exec`.
 A failed cluster blocks its MSP, so a half-built MSP never commits and never
 opens a PR.
+
+**Route the model off the tier, or the tiering saves nothing.** `--exec`
+substitutes `{model}` from `--tier-models`, so the expensive model runs only
+where the plan says it is warranted:
+
+```bash
+--exec 'claude --model {model} -p {prompt}' --tier-models top=opus,cheap=sonnet
+--exec 'codex exec -m {model} {prompt}'     --tier-models top=gpt-5,cheap=gpt-5-mini
+```
+
+Agent-agnostic: the template is yours, so anything with a model flag works. If
+`{model}` is used and a tier has no mapping, fanout refuses to start rather than
+quietly running that cluster on your agent's default — which is the exact
+failure tiering exists to prevent. `{tier}` substitutes the raw `top`/`cheap` if
+you would rather branch in a wrapper script.
 
 - `--no-push` commits without pushing; `--no-branches` runs everything in one
   tree, for a scratch or non-git directory.

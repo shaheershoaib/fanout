@@ -289,8 +289,15 @@ across waves and WITHIN one, since a wave wider than your concurrency cap queues
   `types/AuthResponse.ts` and on `app/auth/route.ts`, but NOT inside
   `(unauthenticated)`. A marker containing a separator (`api/auth`, `.sql`) is
   read as a path fragment and keeps substring behaviour.
-- Map `tier` to the model per leaf; the orchestrator + every review/gate/ship step
-  stays top-tier. `tier` now reads TWO axes - blast radius (path markers, plus a
+- **Route the model off `tier` in the SPAWN COMMAND**, not by hand: `--exec
+  'claude --model {model} -p {prompt}' --tier-models top=opus,cheap=sonnet`
+  (`codex exec -m {model} {prompt}` works the same way). A tier nothing routes
+  on saves nothing, and fanout refuses to start if `{model}` is used with an
+  unmapped tier rather than silently falling back to your default model. The
+  orchestrator + every review/gate step stays top-tier.
+- A cluster never spans two MSPs, because it converges into one branch. A
+  dependency ACROSS MSPs therefore stays a dispatch edge and is never fused into
+  one agent - two PRs must stay two PRs. `tier` now reads TWO axes - blast radius (path markers, plus a
   history bump) and `complexity` when the item supplies it. `cheap` requires BOTH
   mechanical and low-blast-radius: path markers alone send the capable model to
   one-word copy changes and the cheap model to hard refactors.
