@@ -71,9 +71,14 @@ flowchart TB
 
 **MSP boundaries are semantic, and recon draws them.** "What merges coherently
 on its own" is readable from the ask itself, before any file has been looked at.
-File overlap does not *define* an MSP — it can only ever **merge** two that
-recon proposed separately and that turn out to collide. Merge-only, never
-split.
+File overlap does not *define* an MSP — it can only ever **fuse** two that recon
+proposed separately and whose leaves collide. Fuse-only, never split.
+
+**Two kinds of serialization, one primitive.** A *dependency* is directed — A
+then B, and reversing it is wrong. A *collision* (two leaves editing one file)
+is undirected — they must not run concurrently, but either order is fine. Both
+are satisfied the same way: put them in one cluster and let one agent walk them
+sequentially. Everything below follows from that.
 
 1. **Ingest** — plain text asks.
 2. **Recon** — top-down, in one pass: read each ask, decide the **MSP** it
@@ -94,10 +99,13 @@ split.
    entrypoint files to any `feature` or `port` item by default. Two net-new
    items both silently editing `router.tsx` is a genuine cross-MSP collision
    that grouping would otherwise never see.
-3. **Merge colliding MSPs** — the safety net, not the definition. If two MSPs
-   recon proposed separately share an edited file or a `contract_group`, they
-   fuse into one, because two open PRs must never edit the same file. This step
-   only ever reduces the MSP count.
+3. **Fuse MSPs whose leaves collide** — a consequence of one structural rule,
+   not a separate safety net: **a cluster cannot span two MSPs**, because a
+   cluster converges into one branch and one PR. Two leaves editing the same
+   file must serialize, which means one cluster; if they sit in different MSPs
+   that cluster would have to straddle both, so the MSPs fuse. Same for a
+   `contract_group`. Collisions *within* one MSP need nothing here — clustering
+   handles them at step 4. This step only ever reduces the MSP count.
 4. **Split each MSP into clusters** — a cluster is a **weakly-connected
    component of the dependency graph** within the MSP: one owner, sequential
    inside, and independent of every other cluster by construction, **subject to
