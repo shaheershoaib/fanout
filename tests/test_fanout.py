@@ -364,6 +364,34 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(argv[2], nasty)   # intact, and a single argv element
         self.assertEqual(len(argv), 3)     # nothing split into extra tokens
 
+    def test_argv_carries_the_tier_so_the_spawn_can_route_on_it(self):
+        """Tiering saves nothing unless something ROUTES on it, and the routing knob
+        is the command line. Before this, {tier} reached the prompt only - the agent
+        could read about its tier and not be selected by it."""
+        argv = fp.build_argv("agent --model {tier} -p {prompt}", "do it",
+                             {"name": "A", "files": []}, tier="cheap")
+        self.assertEqual(argv, ["agent", "--model", "cheap", "-p", "do it"])
+
+    def test_argv_carries_cluster_and_msp(self):
+        argv = fp.build_argv("agent --tag {cluster}/{msp} -p {prompt}", "x",
+                             {"name": "A", "files": []}, cluster="c3", msp=2)
+        self.assertIn("c3/2", argv)
+
+    def test_unsupplied_placeholders_collapse_to_empty_not_literal(self):
+        """A template asking for a tier that was never supplied must not pass the
+        literal string '{tier}' to the agent as if it were a model name."""
+        argv = fp.build_argv("agent --model {tier} -p {prompt}", "x",
+                             {"name": "A", "files": []})
+        self.assertNotIn("{tier}", argv)
+
+    def test_tier_substitution_cannot_inject_extra_argv(self):
+        """The same guarantee the prompt has: a value lands as ONE token."""
+        argv = fp.build_argv("agent --model {tier} -p {prompt}", "x",
+                             {"name": "A", "files": []},
+                             tier="a b; rm -rf /")
+        self.assertEqual(argv[2], "a b; rm -rf /")
+        self.assertEqual(len(argv), 5)
+
     def test_render_prompt_is_self_contained(self):
         """A spawned process inherits no conversation."""
         pack = {"edit": ["a.py"], "read": ["b.py"]}

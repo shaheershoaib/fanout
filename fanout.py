@@ -1130,8 +1130,9 @@ def run_recon(asks, exec_template, concurrency=4, cwd=None, poll=0.2,
             idx, ask = pending.pop(0)
             prompt = render_recon_prompt(ask, graph_path, prompt_template,
                                          contract)
-            argv = build_argv(exec_template, prompt, {"name": "recon-%d" % idx,
-                                                      "files": []})
+            argv = build_argv(exec_template, prompt,
+                              {"name": "recon-%d" % idx, "files": []},
+                              tier="top", cluster="recon-%d" % idx, msp="")
             env = dict(os.environ, FANOUT_RECON="1", FANOUT_ASK=ask,
                        FANOUT_GRAPH=graph_path or "")
             out_path = os.path.join(tmp, "ask-%d.out" % idx)
@@ -1296,13 +1297,22 @@ def render_cluster_prompt(members, by_name, packs, tier, order,
     return "\n".join(lines)
 
 
-def build_argv(exec_template, prompt, item):
+def build_argv(exec_template, prompt, item, tier="", cluster="", msp=""):
     """argv WITHOUT a shell: split the template FIRST, then substitute into the
     resulting tokens, so a prompt containing quotes, newlines, backticks or
-    semicolons lands as ONE argument and can never be re-read as shell syntax."""
+    semicolons lands as ONE argument and can never be re-read as shell syntax.
+
+    `{tier}` is here so the SPAWN COMMAND can act on the tier, not just mention it
+    in the prompt. Tiering only saves anything if something routes on it, and the
+    routing knob is the command line - `agent --model {tier} -p {prompt}`. Without
+    this the tier reached the agent as text it could read about itself and not act
+    on, so every cluster ran on one model whatever the plan said."""
     return [tok.replace("{prompt}", prompt)
                .replace("{name}", item["name"])
                .replace("{files}", ",".join(item.get("files", [])))
+               .replace("{tier}", tier)
+               .replace("{cluster}", str(cluster))
+               .replace("{msp}", str(msp))
             for tok in shlex.split(exec_template)]
 
 
@@ -1484,7 +1494,8 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
                 members, by_name, packs, cluster_tier(nxt), order,
                 prompt_template, contract)
             head = by_name.get(members[0], {"name": members[0], "files": []})
-            argv = build_argv(exec_template, prompt, head)
+            argv = build_argv(exec_template, prompt, head, tier=cluster_tier(nxt),
+                              cluster=label(nxt), msp=cluster_msp.get(nxt, ""))
             if dry_run:
                 status[nxt] = "ok"
                 records.append({"item": label(nxt), "cluster": label(nxt),
@@ -1587,7 +1598,9 @@ def main():
                     help="EXECUTE the plan: a command template run once per item, "
                          "e.g. 'claude -p {prompt}' or 'codex exec {prompt}'. "
                          "Split into argv BEFORE substitution (no shell). "
-                         "Placeholders: {prompt} {name} {files}. Omit to only print "
+                         "Placeholders: {prompt} {name} {files} {tier} {cluster} "
+                         "{msp} - use {tier} to route the model, e.g. "
+                         "'claude --model {tier} -p {prompt}'. Omit to only print "
                          "the plan.")
     ap.add_argument("--no-briefs", action="store_true",
                     help="omit `cluster_briefs` from the plan. The briefs are "
