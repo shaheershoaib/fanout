@@ -42,6 +42,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -89,11 +90,17 @@ def _item_graph_files(file_paths, adj_keys):
     return {k for f in file_paths for k in adj_keys if _paths_match(f, k)}
 
 
-def cluster_items(items):
-    """Union items that MUST serialize: they share an edited file OR a declared
-    contract_group (two halves of one contract -> one owner, even when their
-    edited files are disjoint). Distinct clusters are file- and contract-disjoint
-    -> safe to run in parallel."""
+def msp_items(items):
+    """Group items into MSPs - the unit that becomes one branch and one PR.
+
+    Items are unioned when they MUST serialize: a shared edited file, or a
+    declared contract_group (two halves of one contract, even when their edited
+    files are disjoint). Distinct MSPs are file- and contract-disjoint, so two
+    open PRs never touch the same file.
+
+    This does not DEFINE an MSP boundary - recon does that, semantically. This
+    only FUSES two that turn out to collide, because a cluster converges into
+    one branch and so cannot span two MSPs."""
     parent = {it["name"]: it["name"] for it in items}
 
     def find(x):
@@ -122,6 +129,129 @@ def cluster_items(items):
     for it in items:
         groups[find(it["name"])].append(it["name"])
     return list(groups.values())
+
+
+def _pinned_contract_groups(items):
+    """contract_groups whose interface is PINNED by a producer item in the same
+    group (an item of type "contract" that the other members declare `after`).
+    An unpinned group must serialize under one owner - two agents building two
+    halves of one interface invent two different shapes. A pinned one may split,
+    because the shape is fixed before either half starts."""
+    pinned = set()
+    by_group = defaultdict(list)
+    for it in items:
+        g = it.get("contract_group")
+        if g:
+            by_group[g].append(it)
+    for g, members in by_group.items():
+        producers = {m["name"] for m in members if m.get("type") == "contract"}
+        if not producers:
+            continue
+        consumers = [m for m in members if m["name"] not in producers]
+        if consumers and all(producers & set(m.get("after") or [])
+                             for m in consumers):
+            pinned.add(g)
+    return pinned
+
+
+def cluster_items(items):
+    """Partition items into CLUSTERS: the unit one agent owns and walks
+    sequentially.
+
+    A cluster is a weakly-connected component of the serialization graph, whose
+    edges are the two things that force two leaves not to run concurrently:
+
+      - a shared edited file, or an UNPINNED contract_group  (undirected: they
+        must not run at once, but either order is fine)
+      - a declared `after` edge                              (directed: one
+        genuinely needs the other's output)
+
+    Both are satisfied by the same primitive - one agent, sequential - so both
+    are edges here. Independent leaves come out as clusters of one, which is the
+    common case and the best one.
+
+    An `after` edge whose endpoints land in DIFFERENT clusters (a diamond, or a
+    dependency across MSPs) stays a dispatch edge; see `cluster_after`."""
+    parent = {it["name"]: it["name"] for it in items}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    msp_of = {}
+    for group in msp_items(items):
+        for n in group:
+            msp_of[n] = group[0]
+
+    pinned = _pinned_contract_groups(items)
+    owner, group_owner = {}, {}
+    by_name = {it["name"]: it for it in items}
+    for it in items:
+        for f in it["files"]:
+            if f in owner:
+                union(it["name"], owner[f])
+            else:
+                owner[f] = it["name"]
+        g = it.get("contract_group")
+        if g and g not in pinned:
+            if g in group_owner:
+                union(it["name"], group_owner[g])
+            else:
+                group_owner[g] = it["name"]
+
+    # A directed edge fuses only where fusing COSTS nothing: a true chain link,
+    # one producer with one consumer. Fusing a BRANCHING edge would destroy the
+    # parallelism it exists to enable - a pinned contract is exactly one
+    # producer with two consumers, and the whole point of pinning is that the
+    # two halves then run at once. Branching edges stay dispatch edges.
+    # Cross-MSP edges never fuse either: that would collapse two PRs into one.
+    consumers = defaultdict(set)
+    producers = defaultdict(set)
+    for it in items:
+        for dep in (it.get("after") or []):
+            if dep in by_name:
+                consumers[dep].add(it["name"])
+                producers[it["name"]].add(dep)
+    for it in items:
+        n = it["name"]
+        for dep in producers[n]:
+            same_msp = msp_of.get(dep) == msp_of.get(n)
+            chain_link = len(consumers[dep]) == 1 and len(producers[n]) == 1
+            if same_msp and chain_link:
+                union(n, dep)
+
+    groups = defaultdict(list)
+    for it in items:
+        groups[find(it["name"])].append(it["name"])
+    return list(groups.values())
+
+
+def cluster_after(items, clusters):
+    """Per cluster, the OTHER clusters whose build must complete before it
+    starts - the `after` edges whose endpoints fell in different clusters.
+
+    Carried by the CLUSTER that needs it, never by its MSP: if one of B's five
+    leaves depends on A, that leaf's cluster waits and B's other four start
+    immediately. Gating a whole MSP would be a barrier at MSP scope, which is
+    the error waves made one level up."""
+    cid = {}
+    for i, members in enumerate(clusters):
+        for n in members:
+            cid[n] = i
+    out = {i: set() for i in range(len(clusters))}
+    for it in items:
+        mine = cid[it["name"]]
+        for dep in (it.get("after") or []):
+            if dep in cid and cid[dep] != mine:
+                out[mine].add(cid[dep])
+    return {i: sorted(v) for i, v in out.items() if v}
 
 
 def _conflict_adjacency(items):
@@ -416,7 +546,8 @@ def coupling_review(items, adj, risk_markers, trajectories=None):
             if any(bf in adj.get(af, ()) for af in gfiles[a] for bf in gfiles[b]):
                 signals.append("import-adjacent")
             shared = sorted({m for m in risk_markers
-                             if any(m in f for f in files[a]) and any(m in f for f in files[b])})
+                             if any(marker_matches(f, m) for f in files[a])
+                             and any(marker_matches(f, m) for f in files[b])})
             signals += ["shared-risk-marker:" + m for m in shared]
             regression = (any(_entry_regresses_item(e, by_name[b]) for e in matched[a])
                           or any(_entry_regresses_item(e, by_name[a]) for e in matched[b]))
@@ -430,10 +561,64 @@ def coupling_review(items, adj, risk_markers, trajectories=None):
     return out
 
 
-def tier_for(file_paths, risk_markers):
+_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _path_words(path):
+    """The words in a path, split on separators AND camelCase, lowercased.
+
+    `app/types/AuthResponse.ts` -> {app, types, auth, response, ts}
+    `app/(unauthenticated)/x`   -> {app, unauthenticated, x}
+
+    The second one is the whole point: "unauthenticated" is one word and does
+    NOT contain the word "auth", even though it contains the substring."""
+    return {w.lower() for part in re.split(r"[^A-Za-z0-9]+", path) if part
+            for w in _WORD.findall(part)}
+
+
+def marker_matches(path, marker):
+    """Does a risk marker apply to this path?
+
+    Raw substring matching was wrong in both directions at once: marker `auth`
+    fired on `app/(unauthenticated)/forgotPassword/page.tsx` (a copy change sent
+    to the expensive model) and missed `app/types/AuthResponse.ts` (auth code
+    sent to the cheap one).
+
+    So: a plain marker matches a WORD of the path, case-insensitively. A marker
+    containing any separator (`api/auth`, `.sql`) is meant as a path fragment and
+    keeps case-insensitive substring behaviour, since that is the only thing it
+    could mean."""
+    m = marker.strip().lower()
+    if not m:
+        return False
+    if not m.isalnum():
+        return m in path.lower()
+    return m in _path_words(path)
+
+
+def tier_for(file_paths, risk_markers, complexity=None):
+    """Two axes, because blast radius alone mis-routes in both directions: a
+    one-word copy change under a marked path comes out `top`, and a hard
+    refactor in an unmarked one comes out `cheap`.
+
+                 | low blast radius | high blast radius
+      simple     | cheap            | top
+      complex    | top              | top
+
+    `cheap` requires BOTH mechanical and low-blast-radius. The asymmetry is
+    deliberate: a wrong cheap call costs a rebuild, a wrong top call costs
+    tokens.
+
+    complexity is OPTIONAL and comes from recon, which is the only part of the
+    system that can judge it. When it is absent this falls back to the
+    blast-radius-only behaviour, so a caller that does not supply it is
+    unaffected."""
     for f in file_paths:
-        if any(m in f for m in risk_markers):
+        if any(marker_matches(f, m) for m in risk_markers):
             return "top"
+    if complexity is not None and str(complexity).lower() not in ("simple", "low",
+                                                                 "mechanical"):
+        return "top"
     return "cheap"
 
 
@@ -579,7 +764,7 @@ def plan(items, graph_path, risk_markers, trajectories=None,
     trajectories = trajectories or []
     tier, tier_notes = {}, {}
     for it in items:
-        t = tier_for(it["files"], risk_markers)
+        t = tier_for(it["files"], risk_markers, it.get("complexity"))
         if t != "top" and trajectories:
             bump, reason = history_tier_bump(it, trajectories)
             if bump:
@@ -596,8 +781,12 @@ def plan(items, graph_path, risk_markers, trajectories=None,
                          downstream_cost(items, cost))
     packs = context_packs(items, adj, context_hops, context_cap)
     deps = ready_after(items, waves)
+    msps = msp_items(items)
+    clusters = cluster_items(items)
     result = {
-        "clusters": cluster_items(items),
+        "msps": msps,
+        "clusters": clusters,
+        "cluster_after": cluster_after(items, clusters),
         "waves": waves,
         "ready_after": deps,
         "coupling_review": review,
@@ -616,6 +805,59 @@ def plan(items, graph_path, risk_markers, trajectories=None,
             result[key] = value
     result["plan_id"] = plan_id(result)
     return result
+
+
+def reconcile(items, clusters, actual_files):
+    """Check the prediction the whole plan rests on.
+
+    v2 derives merge safety from files recon PREDICTED, which is a guess. This
+    compares it against what each cluster actually changed (`files_changed` in
+    the return contract) and reports the misses that matter.
+
+    A miss inside the item's own MSP is noise - the file was already inside a
+    unit that ships together. A miss that lands in ANOTHER MSP's file set means
+    two MSPs were not disjoint after all and the plan parallelized a real
+    collision. That is the finding; it is reported loudly rather than inferred
+    later from a merge conflict."""
+    msp_of, msp_files = {}, defaultdict(set)
+    by_name = {it["name"]: it for it in items}
+    for group in msp_items(items):
+        for n in group:
+            msp_of[n] = group[0]
+    for it in items:
+        msp_files[msp_of[it["name"]]] |= set(it["files"])
+
+    cluster_of = {}
+    for i, members in enumerate(clusters):
+        for n in members:
+            cluster_of[n] = i
+
+    findings, clean = [], True
+    for name, changed in sorted(actual_files.items()):
+        it = by_name.get(name)
+        if it is None:
+            continue
+        predicted, mine = set(it["files"]), msp_of[name]
+        for f in sorted(set(changed) - predicted):
+            collided = sorted(m for m, fs in msp_files.items()
+                              if m != mine and f in fs)
+            if collided:
+                clean = False
+                findings.append({
+                    "item": name, "file": f, "severity": "collision",
+                    "msp": mine, "also_in_msps": collided,
+                    "detail": "recon did not predict this file, and it belongs "
+                              "to another MSP - those MSPs were not disjoint",
+                })
+            else:
+                findings.append({
+                    "item": name, "file": f, "severity": "noise",
+                    "msp": mine,
+                    "detail": "unpredicted, but inside this item's own MSP",
+                })
+    return {"clean": clean, "findings": findings,
+            "collisions": sum(1 for f in findings
+                              if f["severity"] == "collision")}
 
 
 # ── runner (optional: EXECUTE the plan instead of only printing it) ─────────
