@@ -9,12 +9,20 @@ Turn "fan out only on disjoint files" from manual judgment into a computed plan 
 and, with `--exec`, into the dispatch itself.
 
 **Boundary: fanout takes stated work to open draft PRs; a consumer takes it from there.**
-It plans in seconds, deterministically, and touches no git and ships nothing. With
-`--exec` it will spawn one process per item along the dependency DAG, but it still
-never commits, merges, gates or closes anything - the gated spine, verification and
-close-outs stay with the CONSUMER - whatever your setup uses to prove a change is right.
+
+**Planning touches no git at all** - JSON in, JSON out, deterministic, seconds.
+
+**`--exec` does touch git**, and it is worth being exact about how far, because that
+is what decides whether you point it at a repo you care about. Per MSP it cuts a
+branch and a worktree, dispatches one agent per cluster inside that tree, and when the
+MSP's last cluster succeeds it commits, pushes, and hands the branch to `--pr-exec`
+for a DRAFT PR. What it never does is merge, gate, verify or close anything: the gated
+spine and the close-out stay with the CONSUMER, whatever your setup uses to prove a
+change is right.
+
 Use `--exec` when you want the plan EXECUTED rather than followed by hand; leave it
-off when the consumer is doing its own dispatching.
+off when the consumer is doing its own dispatching, or when you want a plan and
+nothing else.
 
 ## Use it
 
