@@ -39,6 +39,8 @@ for net-new work with nothing to grep - the directory structure. `--emit-items`
 writes the derived items so they can be read and corrected before anything is
 built.
 
+Recon workers inherit the user's global Stop hooks, which can force a final prose message and lose the JSON; pass `--settings <a file containing {"disableAllHooks": true}>` in the `--recon-exec` template.
+
 **From items you already have:**
 
 `python3 ~/.claude/skills/fanout/fanout.py --items <items.json> [--graph <graph.json>] --risk-markers <a,b,c> [--serial-verify-markers <d,e>] [--trajectories <store.jsonl> | --no-trajectories]`
@@ -171,6 +173,15 @@ boundaries only.
 - `--risk-markers`: comma-separated path substrings that force the top model tier
   (the PROJECT supplies these - its own high-risk surfaces, e.g. financial, auth,
   migration, or contract paths).
+- `--shared-files`: (optional) comma-separated files many features edit in
+  DISJOINT regions. An overlap ONLY on these fuses nothing (no MSP, cluster or
+  serialize edge); overlap on any other file fuses as ever. An entry matches a
+  path that equals it, ends with `"/" + entry`, or matches it as an fnmatch glob
+  over the whole path. Use it for files many features append to or edit in
+  disjoint regions: type registries, test registries, API docs, a very large
+  screen component; never a file whose shared lines carry one contract. The
+  features build in parallel and integrate in `integration_order`, reading the
+  hunks both sides changed in that file at each step.
 - `--trajectories`: (optional) a trajectory-memory JSONL store, if the setup
   provides one. Defaults to the global store when present and is read
   automatically, so the plan is HISTORY-AWARE: a surface with a bad track record
@@ -230,12 +241,21 @@ Output JSON:
   sequentially-numbered `migrations/` dir, so building them in parallel produces
   two migrations at the SAME number and one loses the rebase - a collision
   file-overlap clustering misses because the new files have different names).
+  With `--shared-files`, also `shared-file:<path>`: they overlap on a declared
+  shared file (one signal per file; default stays `parallel` unless another
+  signal says `serialize`).
   `default` is `serialize` when they share a risk-marker, have a regression
   history, OR would collide on a migration number (same high-risk subsystem /
   known to break each other / guaranteed rebase conflict -> likely must
   serialize), else `parallel`. Signal-free pairs are omitted, and so are pairs
   already ORDERED by an `after` path (their verdict is declared, not pending).
   This FEEDS the mandatory verdict below; it does NOT decide - the orchestrator does.
+- `integration_order`: (only with `--shared-files`, and only when a shared file
+  is edited by 2+ MSPs) shared file -> those MSPs (indices into `msps`) in the
+  order to merge or rebase them; at each step read the hunks both sides changed
+  in that file. Dependency order first (an MSP after its producers), then the
+  critical-path priority, then input order.
+- `shared_files`: the declared entries, echoed so a saved plan executes the same.
 - `tier`: per item, `top` or `cheap` (map to your models, e.g. top=Opus, cheap=Sonnet).
   A path-marker match forces `top`; trajectory memory ALSO forces `top` for a surface
   with a bad track record (a recorded revert, a speculative ship, a caused-regression,
@@ -323,7 +343,10 @@ across waves and WITHIN one, since a wave wider than your concurrency cap queues
   changing, and a cross-MSP collision exits NON-ZERO even when every cluster
   succeeded: the clusters all worked and the PLAN was still wrong. A miss inside an item's
   own MSP is noise; a miss landing in another MSP's file set means the two were
-  not disjoint and the plan parallelized a real collision.
+  not disjoint and the plan parallelized a real collision. A cross-MSP touch of
+  a declared `--shared-files` file is NOT one: `reconcile` reports it as severity
+  `shared-file` with its integration order (`shared_overlaps`) and the run does
+  not fail.
 - **VERIFY-MODE: fan out the verification the same way you fan out the build (the
   canonical rule, work-type-agnostic - fix, net-new feature, AND port all use it;
   it is the verify twin of the trust-boundary line above).** Read each leaf's

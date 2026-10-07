@@ -96,6 +96,7 @@ It returns:
 | `waves`, `ready_after` | legacy schedule fields; dispatch off clusters instead |
 | `context_packs` | the files each task should read, so an agent is not left hunting |
 | `coupling_review` | file-disjoint pairs that still carry a coupling signal |
+| `integration_order` | with `--shared-files`: for each shared file two or more MSPs edit, the order to merge them in |
 | `verdict_groups` | those pairs bucketed, so one ruling covers many |
 | `coalesce` | small tasks cheaper merged into one worker than spawned separately |
 | `shared_context` | files several tasks would each read — read once, share the digest |
@@ -111,6 +112,53 @@ the examples happen to be web-shaped, the tool is not.
 imports. Graph-driven impact analysis was tried and rejected: transitive coupling
 collapses a real codebase into one serial blob and destroys the parallelism you
 came for. The graph stays advisory.
+
+## Shared files: build in parallel, integrate in order
+
+Some files are edited by nearly every feature, each in its own region: a type
+registry, a test registry, an API doc, a very large screen component. File-overlap
+fusing reads that as "these must be one PR", and a dozen independent features
+collapse into one MSP. The edits do not conflict in substance (they merge with a
+trivial keep-both), so the right plan is to build in parallel and integrate in a
+fixed order.
+
+```bash
+python3 fanout.py --items items.json \
+  --shared-files 'API_CONTRACT.md,packages/contract/src/types.ts,docs/*.md'
+```
+
+An entry matches a path when the path **equals** it, **ends with `/` + the
+entry**, or **matches it as an fnmatch glob** over the whole path (`*` also crosses
+`/`; `[` `]` in a path such as `app/[id]/page.tsx` still match literally, since
+equality is tried first).
+
+- An overlap **only** on shared files fuses nothing: not one MSP, not one cluster,
+  not one serialize edge. An overlap on any other file fuses exactly as before,
+  and `contract_group` and `after` are untouched.
+- Each such pair appears in `coupling_review` with one `shared-file:<path>` signal
+  per shared file it shares, default `parallel` (any other signal that says
+  `serialize` still wins).
+- `integration_order` maps each shared file that two or more MSPs edit to those
+  MSPs (indices into `msps`): **merge or rebase them in this order, and at each
+  step read the hunks both sides changed in that file.** Dependency order comes
+  first (an MSP follows every MSP holding a producer of one of its leaves), then
+  the critical-path priority the schedule already uses, then input order. It is
+  absent when nothing qualifies.
+- Leaves of **one** MSP (fused by a declared `msp`, say) still serialize on a
+  shared file: they share one worktree, and two agents editing one file in one
+  tree at once is a race no merge reconciles.
+- `--exec`: a cross-MSP touch of a shared file is **not** a collision. `reconcile`
+  reports it as severity `shared-file`, with the integration order, counts it in
+  `shared_overlaps`, and the run does not fail. A touch of any other file another
+  MSP predicted still fails it, exactly as before.
+
+Use it for files many features append to or edit in disjoint regions. **Never**
+for a file whose shared lines carry one contract: two features that must agree on
+the same lines belong in one MSP, and declaring that file shared hides it.
+
+Without `--shared-files` the output is byte-identical to a plan computed without
+the feature; the plan echoes `shared_files` when given, so a saved plan executes
+the same way later.
 
 ## Running the plan
 
@@ -188,7 +236,9 @@ no flag, nothing to remember — comparing predicted files against what each
 cluster reported changing, and a cross-MSP collision exits non-zero even when
 every cluster succeeded. A surprise inside an
 MSP is noise; one that lands in another MSP's files means those two were not
-disjoint and the plan ran a real collision in parallel.
+disjoint and the plan ran a real collision in parallel. (The one exception is a
+file you declared with `--shared-files`: that overlap is expected, so it is
+reported with its integration order and does not fail the run.)
 
 Read `--emit-items` before dispatching if the batch is expensive. It writes what
 recon derived so you can correct it before anything is built.
@@ -203,6 +253,9 @@ recon derived so you can correct it before anything is built.
   matches a *word* of the path, case-insensitively, so `auth` matches
   `types/AuthResponse.ts` and `app/auth/route.ts` but not `(unauthenticated)`. A
   marker containing a separator (`api/auth`, `.sql`) is read as a path fragment.
+- `--shared-files`: files many features edit in disjoint regions; an overlap only
+  there does not fuse MSPs, and `integration_order` says how to merge them. See
+  [Shared files](#shared-files-build-in-parallel-integrate-in-order).
 - `--serial-verify-markers` — surfaces whose verification needs a real session.
 - `--trajectories` — a JSONL history store, if you keep one. Strictly additive:
   history only ever raises caution, never relaxes it. Override the default path
@@ -214,7 +267,8 @@ recon derived so you can correct it before anything is built.
 python3 -m unittest discover -s tests
 ```
 
-42 tests, covering the scheduling algebra, the safety invariants, and the runner
+144 tests, covering the scheduling algebra, the safety invariants, shared files, and
+the runner
 (including that a prompt full of shell metacharacters stays one argument).
 
 ## Adapters

@@ -109,7 +109,9 @@ sequentially. Everything below follows from that.
    file must serialize, which means one cluster; if they sit in different MSPs
    that cluster would have to straddle both, so the MSPs fuse. Same for a
    `contract_group`. Collisions *within* one MSP need nothing here — clustering
-   handles them at step 4. This step only ever reduces the MSP count.
+   handles them at step 4. This step only ever reduces the MSP count. A file the
+   caller declared **shared** (see "Shared files") is the one overlap that fuses
+   nothing.
 4. **Split each MSP into clusters** — a cluster is a **weakly-connected
    component of the dependency graph** within the MSP: one owner, sequential
    inside, and independent of every other cluster by construction, **subject to
@@ -189,6 +191,64 @@ it. B's PR then stacks on A's.
 
 So the batch completes in one run, and the only thing that ever waits is an MSP
 whose producer is genuinely still building.
+
+## Shared files
+
+Fusing on a shared edited file assumes two leaves on one file are two edits to
+the same lines. Some files break that assumption in bulk: a type registry, a
+test registry, an API doc, a very large screen component, every feature adds to
+or edits them in its own region. On a real codebase, twelve independent features
+touched five such files and fused all 82 leaves into **one** MSP. The edits merge
+with a trivial keep-both, so the right plan is *build in parallel, integrate in a
+fixed order, and read the shared hunks at each integration*.
+
+`--shared-files <entry,...>` declares them. An entry matches a path when the path
+**equals** it, **ends with `"/" + entry`**, or **matches it as an fnmatch glob**
+over the whole path. (Equality is tried first, so a path made of glob
+metacharacters, `app/(x)/[id]/page.tsx`, still matches itself.)
+
+**What changes.** An overlap that is *only* on shared files fuses nothing: not one
+MSP, not one cluster, not one serialize edge. An overlap on any other file fuses
+exactly as before. `contract_group` and `after` are untouched.
+
+**Within one MSP the relaxation does not apply.** Leaves fused into one MSP by
+other means (a declared `msp`, a pinned `contract_group`) share one worktree. Two
+agents editing one file in one tree at once is a race, not a merge, so they still
+serialize into one cluster on a shared file.
+
+**What is reported.**
+
+- `coupling_review` carries each such pair with one `shared-file:<path>` signal
+  per shared file the pair shares. The default is `parallel` unless another
+  signal on the pair already says `serialize`; the existing precedence is
+  unchanged. The verdict asked of the orchestrator is whether the two regions
+  really are disjoint.
+- `integration_order` maps each shared file that **two or more MSPs** edit to
+  those MSPs (indices into `msps`): merge or rebase them in this order, and at
+  each step read the hunks both sides changed in that file. The order is one total
+  order over MSPs, restricted to each file's editors: dependency order first (an
+  MSP follows every MSP that holds a producer of one of its leaves), then the
+  critical-path priority the schedule uses, then input order, so it is
+  deterministic. Two MSPs that each hold a producer of the other have no valid
+  order; they keep a repeatable one and the plan is not refused.
+- `shared_files` echoes the declared entries, so a saved plan run later with
+  `--plan-file` reconciles the same way.
+
+Both new keys are present only when the flag is given (`integration_order` only
+when some shared file is edited by two or more MSPs). Without the flag the output
+is byte-identical to a plan computed without this feature.
+
+**Reconcile.** A cluster that touches a file recon did not predict, which another
+MSP did, is a collision and fails the run. If that file is a declared shared file
+it is instead an *expected* overlap: the finding has severity `shared-file`,
+carries the integration order of the MSPs involved, is counted in
+`shared_overlaps`, and does not affect `clean`, `collisions` or the exit code. Any
+other collision fails exactly as before.
+
+**When not to use it.** For files many features append to or edit in disjoint
+regions. Never for a file whose shared lines carry one contract: two leaves that
+must agree on the same lines belong in one MSP, and declaring the file shared
+hides that.
 
 ## Tiering: add complexity as a second axis
 
@@ -327,6 +387,8 @@ after the fact:
 - a miss *inside* the MSP is noise;
 - a miss that **crosses an MSP boundary** means two MSPs were not disjoint and
   the plan parallelized a real collision. Report it loudly, keyed to `plan_id`.
+  The exception is a declared shared file: that miss is an expected overlap,
+  reported with its integration order and not counted as a collision.
 
 This is the honest answer to losing determinism. Today's pitch is
 "deterministic, milliseconds, JSON in / JSON out"; v2's inputs are an LLM's
@@ -341,6 +403,7 @@ recon was right, and you will be told when it was not.** The README must say so.
 | `--branch-per-msp`     | one branch per MSP, clusters converge into it |
 | `--pr-exec '<cmd>'`    | e.g. `gh pr create --draft --base {base} --head {branch}` |
 | `--base <ref>`         | integration ref for branches and PRs |
+| `--shared-files <e,..>` | files many features edit in disjoint regions; an overlap only there fuses nothing, and `integration_order` says how to merge |
 
 Every one is a shell-out, same pattern as `--exec`. Auth lives in the spawned
 tool (`gh`, the agent CLI), never in fanout: stdlib and offline stay true.
