@@ -295,6 +295,64 @@ def cluster_after(items, clusters):
     return {i: sorted(v) for i, v in out.items() if v}
 
 
+def msp_rank(items, msps):
+    """Where each MSP (by index into `msps`) sits in ONE total order: the order
+    to integrate them in.
+
+    Dependency order first - an MSP follows every MSP that holds a producer of
+    one of its leaves, which is a per-MSP fact, not a per-leaf one - then the same
+    critical-path priority the schedule uses (longest remaining chain first), then
+    input order, so the answer is deterministic.
+
+    Item-level `after` is acyclic, but two MSPs can each hold a producer of the
+    other. That is not an error here: its members keep the best position the sort
+    gives them, and the order only has to be repeatable."""
+    msp_of = {n: i for i, g in enumerate(msps) for n in g}
+    chain = downstream_cost(items, {it["name"]: item_cost(it) for it in items})
+    priority = {i: max(chain[n] for n in g) for i, g in enumerate(msps)}
+    producers, consumers = defaultdict(set), defaultdict(set)
+    for it in items:
+        for dep in (it.get("after") or []):
+            a, b = msp_of[dep], msp_of[it["name"]]
+            if a != b:
+                producers[b].add(a)
+                consumers[a].add(b)
+    floor = {i: 0 for i in range(len(msps))}
+    waiting = {i: len(producers[i]) for i in floor}
+    queue = [i for i in floor if not waiting[i]]
+    qi = 0
+    while qi < len(queue):
+        i = queue[qi]
+        qi += 1
+        for c in consumers[i]:
+            floor[c] = max(floor[c], floor[i] + 1)
+            waiting[c] -= 1
+            if not waiting[c]:
+                queue.append(c)
+    ranked = sorted(floor, key=lambda i: (floor[i], -priority[i], i))
+    return {m: pos for pos, m in enumerate(ranked)}
+
+
+def integration_order(items, msps, shared_files):
+    """For each shared file that TWO OR MORE MSPs edit, those MSPs (indices into
+    `msps`) in the order to integrate them: merge or rebase them in this order,
+    and at each step READ the hunks both sides changed in that file. The edits are
+    expected to merge with a trivial keep-both; the order makes the one place
+    they might not a fixed, repeatable walk instead of whoever merges first."""
+    is_shared = shared_file_matcher(shared_files)
+    msp_of = {n: i for i, g in enumerate(msps) for n in g}
+    editors = defaultdict(set)
+    for it in items:
+        for f in it["files"]:
+            if is_shared(f):
+                editors[f].add(msp_of[it["name"]])
+    multi = {f: m for f, m in editors.items() if len(m) > 1}
+    if not multi:
+        return {}
+    rank = msp_rank(items, msps)
+    return {f: sorted(multi[f], key=rank.__getitem__) for f in sorted(multi)}
+
+
 def _conflict_adjacency(items, shared_files=None):
     """name -> set of names it MUST serialize with: shared edited file OR shared
     contract_group (the same keys cluster_items unions on, kept pairwise here so
@@ -868,6 +926,9 @@ def plan(items, graph_path, risk_markers, trajectories=None,
         result["tier_notes"] = tier_notes
     if shared_files:  # only present when the caller declared any
         result["shared_files"] = shared_files
+        order = integration_order(items, msps, shared_files)
+        if order:
+            result["integration_order"] = order
     for key, value in (("verdict_groups", verdict_groups(review)),
                        ("shared_context", shared_context(packs, waves)),
                        ("coalesce", coalesce_groups(items, waves, tier, cost,

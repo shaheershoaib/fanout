@@ -1280,6 +1280,105 @@ class SharedFilesPlanning(unittest.TestCase):
         self.assertNotIn("integration_order", off)
 
 
+class IntegrationOrder(unittest.TestCase):
+    """Parallel build, serial integration: for every shared file two or more MSPs
+    edit, the order to merge them in. Each entry is an MSP index into `msps`."""
+
+    API = "docs/API.md"
+
+    def order(self, items, shared=("types.ts", "API.md"), **kw):
+        out = fp.plan(items, None, [], trajectories=[], shared_files=list(shared), **kw)
+        named = {f: ["+".join(sorted(out["msps"][i])) for i in idx]
+                 for f, idx in out.get("integration_order", {}).items()}
+        return out, named
+
+    def test_each_shared_file_two_msps_edit_gets_an_ordered_list(self):
+        items = [{"name": "a", "files": ["a.ts", TYPES, self.API], "cost": 3},
+                 {"name": "b", "files": ["b.ts", TYPES]},
+                 {"name": "c", "files": ["c.ts", self.API]},
+                 {"name": "d", "files": ["d.ts", "docs/only-d.md"]}]
+        out, named = self.order(items, shared=("types.ts", "API.md", "only-d.md"))
+        self.assertEqual(named, {self.API: ["a", "c"], TYPES: ["a", "b"]})
+        self.assertEqual(list(out["integration_order"]), sorted(out["integration_order"]))
+        self.assertTrue(all(isinstance(i, int)
+                            for v in out["integration_order"].values() for i in v))
+
+    def test_a_shared_file_only_one_msp_edits_is_not_listed(self):
+        items = [{"name": "a", "files": ["a.ts", TYPES]}, {"name": "b", "files": ["b.ts"]}]
+        out, named = self.order(items)
+        self.assertNotIn("integration_order", out)
+
+    def test_two_leaves_of_one_msp_count_once(self):
+        items = [{"name": "a1", "files": ["a1.ts", TYPES], "msp": "A"},
+                 {"name": "a2", "files": ["a2.ts", "a1.ts"], "msp": "A"},
+                 {"name": "b", "files": ["b.ts", TYPES]}]
+        out, named = self.order(items)
+        self.assertEqual(sorted(named[TYPES]), ["a1+a2", "b"])
+
+    def test_dependency_order_comes_first(self):
+        """The consumer is listed FIRST and is the bigger leaf, so both input
+        order and size say consumer-first; the `after` edge says otherwise."""
+        items = [{"name": "consumer", "files": ["c.ts", TYPES], "cost": 9,
+                  "after": ["producer"]},
+                 {"name": "producer", "files": ["p.ts", TYPES], "cost": 1}]
+        out, named = self.order(items)
+        self.assertEqual(named[TYPES], ["producer", "consumer"])
+
+    def test_dependency_order_is_per_msp_not_per_leaf(self):
+        """MSP A holds a big free leaf AND a leaf that waits on B, so A's own
+        priority beats B's - yet A cannot integrate before the MSP it waits on."""
+        items = [{"name": "a1", "files": ["a1.ts", TYPES], "cost": 100, "msp": "A"},
+                 {"name": "a2", "files": ["a2.ts"], "msp": "A", "after": ["b1"]},
+                 {"name": "b1", "files": ["b1.ts", TYPES], "cost": 1}]
+        out, named = self.order(items)
+        self.assertEqual(named[TYPES], ["b1", "a1+a2"])
+
+    def test_then_the_critical_path_orders_independent_msps(self):
+        items = [{"name": "short", "files": ["s.ts", TYPES], "cost": 1},
+                 {"name": "long", "files": ["l.ts", TYPES], "cost": 5},
+                 {"name": "chain-head", "files": ["h.ts", TYPES], "cost": 1},
+                 {"name": "chain-tail", "files": ["t.ts"], "cost": 8,
+                  "after": ["chain-head"]}]
+        _, named = self.order(items)
+        self.assertEqual(named[TYPES], ["chain-head", "long", "short"])
+
+    def test_ties_fall_back_to_input_order_and_the_plan_is_repeatable(self):
+        items = [{"name": n, "files": [n + ".ts", TYPES]} for n in "xyz"]
+        out, named = self.order(items, shared=("types.ts",))
+        self.assertEqual(named[TYPES], ["x", "y", "z"])
+        again = fp.plan(items, None, [], trajectories=[], shared_files=["types.ts"])
+        self.assertEqual(again["integration_order"], out["integration_order"])
+        self.assertEqual(again["plan_id"], out["plan_id"])
+
+    def test_a_cycle_between_msps_is_ordered_not_fatal(self):
+        """Item-level `after` is acyclic, but each MSP can hold a producer of the
+        other. That is a plan worth warning about, not one worth crashing on."""
+        items = [{"name": "a1", "files": ["a1.ts", TYPES], "msp": "A", "after": ["b1"]},
+                 {"name": "a2", "files": ["a2.ts"], "msp": "A"},
+                 {"name": "b1", "files": ["b1.ts", TYPES], "msp": "B"},
+                 {"name": "b2", "files": ["b2.ts"], "msp": "B", "after": ["a2"]}]
+        _, named = self.order(items)
+        self.assertEqual(sorted(named[TYPES]), ["a1+a2", "b1+b2"])
+
+    def test_a_glob_entry_lists_every_concrete_file_it_matched(self):
+        items = [{"name": "a", "files": ["docs/one.md", "docs/two.md"]},
+                 {"name": "b", "files": ["docs/one.md"]},
+                 {"name": "c", "files": ["docs/two.md"]}]
+        _, named = self.order(items, shared=("docs/*.md",))
+        self.assertEqual(named, {"docs/one.md": ["a", "b"], "docs/two.md": ["a", "c"]})
+
+    def test_overlap_on_a_real_file_still_fuses_into_one_entry(self):
+        items = [{"name": "a", "files": ["lib/x.ts", TYPES]},
+                 {"name": "b", "files": ["lib/x.ts", TYPES]},
+                 {"name": "c", "files": ["c.ts", TYPES]}]
+        _, named = self.order(items)
+        self.assertEqual(named[TYPES], ["a+b", "c"])
+
+    def test_without_the_flag_there_is_no_order(self):
+        items = [{"name": "a", "files": [TYPES]}, {"name": "b", "files": [TYPES]}]
+        self.assertNotIn("integration_order", fp.plan(items, None, [], trajectories=[]))
+
+
 class NoSharedFilesIsUnchanged(unittest.TestCase):
     """Without the flag the plan is what it was before the feature existed. The
     golden file was produced by the pre-feature planner (origin/main at 8de9992)."""
