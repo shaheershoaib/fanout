@@ -20,6 +20,14 @@ store, or --no-trajectories, the output is identical to the marker-only plan.
 History only ever ADDS caution - it bumps a tier UP and adds serialize hints; it
 never relaxes a tier or removes a coupling signal.
 
+shared_files (--shared-files): files many features edit in DISJOINT regions - type
+registries, test registries, an API doc, a huge screen component. An overlap ONLY
+there fuses nothing (no MSP, cluster or serialize edge); the pair is flagged in
+coupling_review as `shared-file:<path>` and `integration_order` says in which
+order the MSPs editing each such file are to be merged, reading both sides' hunks
+at each step. Overlap on any other file fuses exactly as before, and without the
+flag the output is unchanged.
+
 The graph is a HINT, not a merge-safety oracle: file-level granularity; may be
 stale; blind to the cross-repo API contract. The orchestrator still reviews
 diffs AND renders the coupling_review verdicts.
@@ -982,7 +990,7 @@ def plan(items, graph_path, risk_markers, trajectories=None,
     return result
 
 
-def reconcile(items, clusters, actual_files):
+def reconcile(items, clusters, actual_files, shared_files=None):
     """Check the prediction the whole plan rests on.
 
     v2 derives merge safety from files recon PREDICTED, which is a guess. This
@@ -993,10 +1001,17 @@ def reconcile(items, clusters, actual_files):
     unit that ships together. A miss that lands in ANOTHER MSP's file set means
     two MSPs were not disjoint after all and the plan parallelized a real
     collision. That is the finding; it is reported loudly rather than inferred
-    later from a merge conflict."""
+    later from a merge conflict.
+
+    The exception is a DECLARED shared file (`shared_files`): several MSPs edit
+    it on purpose and integrate in `integration_order`, so a cross-MSP touch of
+    one is reported as severity `shared-file` - with the order to integrate in -
+    and is neither a collision nor a reason to fail the run."""
+    is_shared = shared_file_matcher(shared_files)
+    msps = msp_items(items, shared_files)
     msp_of, msp_files = {}, defaultdict(set)
     by_name = {it["name"]: it for it in items}
-    for group in msp_items(items):
+    for group in msps:
         for n in group:
             msp_of[n] = group[0]
     for it in items:
@@ -1016,7 +1031,16 @@ def reconcile(items, clusters, actual_files):
         for f in sorted(set(changed) - predicted):
             collided = sorted(m for m, fs in msp_files.items()
                               if m != mine and f in fs)
-            if collided:
+            if collided and is_shared(f):
+                findings.append({
+                    "item": name, "file": f, "severity": "shared-file",
+                    "msp": mine, "also_in_msps": collided,
+                    "integration_order": _named_order(items, msps, [mine] + collided),
+                    "detail": "expected overlap on a declared shared file, not a "
+                              "plan error: integrate these MSPs in this order and "
+                              "read the hunks both sides changed in this file",
+                })
+            elif collided:
                 clean = False
                 findings.append({
                     "item": name, "file": f, "severity": "collision",
@@ -1030,9 +1054,21 @@ def reconcile(items, clusters, actual_files):
                     "msp": mine,
                     "detail": "unpredicted, but inside this item's own MSP",
                 })
-    return {"clean": clean, "findings": findings,
-            "collisions": sum(1 for f in findings
-                              if f["severity"] == "collision")}
+    out = {"clean": clean, "findings": findings,
+           "collisions": sum(1 for f in findings
+                             if f["severity"] == "collision")}
+    overlaps = sum(1 for f in findings if f["severity"] == "shared-file")
+    if overlaps:  # absent unless a declared shared file was actually crossed
+        out["shared_overlaps"] = overlaps
+    return out
+
+
+def _named_order(items, msps, names):
+    """MSPs given by name (the first leaf, as reconcile names them) put in
+    integration order."""
+    index = {g[0]: i for i, g in enumerate(msps)}
+    rank = msp_rank(items, msps)
+    return sorted(set(names), key=lambda n: rank[index[n]])
 
 
 # ── runner (optional: EXECUTE the plan instead of only printing it) ─────────
@@ -1776,7 +1812,8 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
             if name in by_name and isinstance(changed, list):
                 actual[name] = changed
     if actual:
-        result["reconcile"] = reconcile(items, clusters, actual)
+        result["reconcile"] = reconcile(items, clusters, actual,
+                                        plan_obj.get("shared_files"))
     if run_dir:
         result["run_dir"] = run_dir
     return result
@@ -1994,7 +2031,9 @@ def main():
         raise SystemExit(1)
     # nor may a cross-MSP collision: every cluster succeeded, and the PLAN was
     # still wrong - two MSPs were not disjoint and ran in parallel anyway. That
-    # is the failure this tool exists to prevent, so it cannot exit 0.
+    # is the failure this tool exists to prevent, so it cannot exit 0. A touch
+    # of a DECLARED shared file is reported as `shared_overlaps`, not counted
+    # here: those MSPs overlap on purpose and integrate in a stated order.
     if result.get("reconcile", {}).get("collisions"):
         raise SystemExit(1)
 

@@ -1379,6 +1379,127 @@ class IntegrationOrder(unittest.TestCase):
         self.assertNotIn("integration_order", fp.plan(items, None, [], trajectories=[]))
 
 
+class SharedFilesExec(unittest.TestCase):
+    """`--exec` fails a run whose MSPs collide on a file recon did not predict.
+    On a DECLARED shared file that overlap is expected: it is reported with the
+    order to integrate in, and the run does not fail."""
+
+    ITEMS = [{"name": "one", "files": ["a/f.py"], "task": "t"},
+             {"name": "two", "files": ["b/f.py"], "task": "t"},
+             {"name": "three", "files": ["c/f.py"], "task": "t"},
+             {"name": "four", "files": ["d/f.py"], "task": "t"}]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def worker(self, extra):
+        """A fake worker that reports its own files plus `extra[cluster]`."""
+        path = os.path.join(self.tmp, "w.py")
+        with open(path, "w") as f:
+            f.write("import os, json\n"
+                    "extra = %r\n"
+                    "c = os.environ['FANOUT_CLUSTER']\n"
+                    "mine = [f for f in os.environ.get('FANOUT_FILES','').split(',') if f]\n"
+                    "print(json.dumps({'item': c, 'status': 'ok',"
+                    " 'files_changed': mine + extra.get(c, []), 'notes': 'd'}))\n" % extra)
+        return "%s %s" % (sys.executable, path)
+
+    def run_it(self, extra, shared=None, items=None):
+        items = items or self.ITEMS
+        pl = fp.plan(items, None, [], trajectories=[], shared_files=shared)
+        return fp.run_plan(pl, items, self.worker(extra), branches=False,
+                           push_remote=None, run_dir=os.path.join(self.tmp, "rd"))
+
+    def cli(self, extra, *flags, items=None):
+        items_path = os.path.join(self.tmp, "items.json")
+        with open(items_path, "w") as f:
+            json.dump(items or self.ITEMS, f)
+        return subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(fp.__file__), "fanout.py"),
+             "--items", items_path, "--no-trajectories", "--no-branches",
+             "--exec", self.worker(extra), "--run-dir", os.path.join(self.tmp, "rd")]
+            + list(flags), capture_output=True, text=True)
+
+    def test_without_the_flag_a_cross_msp_touch_is_a_collision(self):
+        rc = self.run_it({"one": ["b/f.py"]})["reconcile"]
+        self.assertFalse(rc["clean"])
+        self.assertEqual(rc["collisions"], 1)
+        self.assertNotIn("shared_overlaps", rc)
+
+    def test_a_collision_only_on_a_shared_file_is_an_expected_overlap(self):
+        res = self.run_it({"one": ["b/f.py"]}, shared=["b/f.py"])
+        rc = res["reconcile"]
+        self.assertTrue(rc["clean"])
+        self.assertEqual(rc["collisions"], 0)
+        self.assertEqual(rc["shared_overlaps"], 1)
+        (hit,) = rc["findings"]
+        self.assertEqual((hit["item"], hit["file"], hit["severity"]),
+                         ("one", "b/f.py", "shared-file"))
+        self.assertEqual(hit["integration_order"], ["one", "two"])
+        self.assertEqual(res["summary"], {"ok": 4})
+
+    def test_the_overlap_carries_the_plans_integration_order(self):
+        """The MSP that touched the file without predicting it is ordered
+        against the one that did, by the same rule the plan uses: the producer
+        integrates first even though the consumer is listed first."""
+        items = [{"name": "consumer", "files": ["b/f.py"], "task": "t",
+                  "after": ["producer"]},
+                 {"name": "producer", "files": ["a/f.py"], "task": "t"}]
+        rc = self.run_it({"producer": ["b/f.py"]}, shared=["b/f.py"],
+                         items=items)["reconcile"]
+        (hit,) = rc["findings"]
+        self.assertEqual((hit["msp"], hit["also_in_msps"]), ("producer", ["consumer"]))
+        self.assertEqual(hit["integration_order"], ["producer", "consumer"])
+
+    def test_a_collision_on_any_other_file_still_fails_beside_a_shared_one(self):
+        rc = self.run_it({"one": ["b/f.py"], "three": ["d/f.py"]},
+                         shared=["b/f.py"])["reconcile"]
+        self.assertFalse(rc["clean"])
+        self.assertEqual(rc["collisions"], 1)
+        self.assertEqual(rc["shared_overlaps"], 1)
+        sev = {f["file"]: f["severity"] for f in rc["findings"]}
+        self.assertEqual(sev, {"b/f.py": "shared-file", "d/f.py": "collision"})
+
+    def test_an_unpredicted_shared_file_nobody_else_edits_is_still_noise(self):
+        rc = self.run_it({"one": ["a/new.py"]}, shared=["a/new.py"])["reconcile"]
+        self.assertEqual([f["severity"] for f in rc["findings"]], ["noise"])
+        self.assertNotIn("shared_overlaps", rc)
+
+    def test_a_saved_plan_remembers_its_shared_files(self):
+        """--plan-file executes a plan computed earlier, possibly by someone who
+        no longer has the flag to hand."""
+        pl = fp.plan(self.ITEMS, None, [], trajectories=[], shared_files=["b/f.py"])
+        saved = json.loads(json.dumps(pl))
+        res = fp.run_plan(saved, self.ITEMS, self.worker({"one": ["b/f.py"]}),
+                          branches=False, push_remote=None,
+                          run_dir=os.path.join(self.tmp, "rd"))
+        self.assertEqual(res["reconcile"]["collisions"], 0)
+        self.assertEqual(res["reconcile"]["shared_overlaps"], 1)
+
+    def test_cli_exits_zero_on_a_shared_overlap_and_one_on_any_other(self):
+        touch_shared = {"one": ["b/f.py"]}
+        self.assertEqual(self.cli(touch_shared).returncode, 1)               # today
+        ok = self.cli(touch_shared, "--shared-files", "f.py,b/f.py")
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        out = json.loads(ok.stdout)
+        self.assertEqual(out["reconcile"]["shared_overlaps"], 1)
+        self.assertEqual(out["reconcile"]["findings"][0]["integration_order"],
+                         ["one", "two"])
+        bad = self.cli({"one": ["b/f.py"], "three": ["d/f.py"]},
+                       "--shared-files", "b/f.py")
+        self.assertEqual(bad.returncode, 1)
+        self.assertEqual(json.loads(bad.stdout)["reconcile"]["collisions"], 1)
+
+    def test_a_dry_run_has_nothing_to_reconcile_and_does_not_fail(self):
+        pl = fp.plan(self.ITEMS, None, [], trajectories=[], shared_files=["b/f.py"])
+        res = fp.run_plan(pl, self.ITEMS, "true {prompt}", dry_run=True)
+        self.assertEqual(res["summary"]["dry-run"], 4)
+        self.assertNotIn("reconcile", res)
+
+
 class NoSharedFilesIsUnchanged(unittest.TestCase):
     """Without the flag the plan is what it was before the feature existed. The
     golden file was produced by the pre-feature planner (origin/main at 8de9992)."""
