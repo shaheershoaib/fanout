@@ -1,0 +1,577 @@
+{
+  "risk_markers": [
+    "auth",
+    "migrations/"
+  ],
+  "graph": {
+    "nodes": [
+      {
+        "id": "n1",
+        "source_file": "solo/one.py"
+      },
+      {
+        "id": "n2",
+        "source_file": "solo/two.py"
+      },
+      {
+        "id": "n3",
+        "source_file": "pkg/d.ts"
+      }
+    ],
+    "links": [
+      {
+        "source": "n1",
+        "target": "n2"
+      },
+      {
+        "source": "n2",
+        "target": "n3"
+      }
+    ]
+  },
+  "items": [
+    {
+      "name": "types-a",
+      "task": "add type A",
+      "files": [
+        "pkg/types.ts",
+        "pkg/a.ts"
+      ],
+      "complexity": "simple",
+      "type": "feature"
+    },
+    {
+      "name": "types-b",
+      "task": "add type B",
+      "files": [
+        "pkg/types.ts",
+        "pkg/b.ts"
+      ],
+      "complexity": "simple",
+      "type": "feature"
+    },
+    {
+      "name": "types-c",
+      "task": "add type C",
+      "files": [
+        "pkg/types.ts",
+        "pkg/c.ts",
+        "docs/API.md"
+      ],
+      "complexity": "complex",
+      "type": "feature"
+    },
+    {
+      "name": "docs-d",
+      "task": "document D",
+      "files": [
+        "docs/API.md",
+        "pkg/d.ts"
+      ]
+    },
+    {
+      "name": "iface",
+      "task": "pin the shape",
+      "files": [
+        "schema.json"
+      ],
+      "type": "contract",
+      "contract_group": "login"
+    },
+    {
+      "name": "be",
+      "task": "backend half",
+      "files": [
+        "api/login.py"
+      ],
+      "contract_group": "login",
+      "after": [
+        "iface"
+      ]
+    },
+    {
+      "name": "fe",
+      "task": "frontend half",
+      "files": [
+        "web/Login.tsx"
+      ],
+      "contract_group": "login",
+      "after": [
+        "iface"
+      ]
+    },
+    {
+      "name": "auth-fix",
+      "task": "fix auth",
+      "files": [
+        "app/auth/route.ts"
+      ],
+      "cost": 5
+    },
+    {
+      "name": "auth-fix-2",
+      "task": "fix auth again",
+      "files": [
+        "app/auth/session.ts"
+      ],
+      "after": [
+        "auth-fix"
+      ]
+    },
+    {
+      "name": "mig-1",
+      "task": "add column",
+      "files": [
+        "app/billing/migrations/0001_x.py"
+      ]
+    },
+    {
+      "name": "mig-2",
+      "task": "add other column",
+      "files": [
+        "app/billing/migrations/0001_y.py"
+      ]
+    },
+    {
+      "name": "solo",
+      "files": [
+        "solo/one.py"
+      ]
+    },
+    {
+      "name": "solo-2",
+      "task": "neighbour of solo",
+      "files": [
+        "solo/two.py"
+      ]
+    },
+    {
+      "name": "blind",
+      "task": "recon found no files",
+      "files": []
+    }
+  ],
+  "plan": {
+    "msps": [
+      [
+        "types-a",
+        "types-b",
+        "types-c",
+        "docs-d"
+      ],
+      [
+        "iface",
+        "be",
+        "fe"
+      ],
+      [
+        "auth-fix"
+      ],
+      [
+        "auth-fix-2"
+      ],
+      [
+        "mig-1"
+      ],
+      [
+        "mig-2"
+      ],
+      [
+        "solo"
+      ],
+      [
+        "solo-2"
+      ],
+      [
+        "blind"
+      ]
+    ],
+    "clusters": [
+      [
+        "types-c",
+        "types-a",
+        "docs-d",
+        "types-b"
+      ],
+      [
+        "iface"
+      ],
+      [
+        "be"
+      ],
+      [
+        "fe"
+      ],
+      [
+        "auth-fix"
+      ],
+      [
+        "auth-fix-2"
+      ],
+      [
+        "mig-1"
+      ],
+      [
+        "mig-2"
+      ],
+      [
+        "solo"
+      ],
+      [
+        "solo-2"
+      ],
+      [
+        "blind"
+      ]
+    ],
+    "cluster_after": {
+      "2": [
+        1
+      ],
+      "3": [
+        1
+      ],
+      "5": [
+        4
+      ]
+    },
+    "coupling_review": [
+      {
+        "pair": [
+          "docs-d",
+          "solo-2"
+        ],
+        "signals": [
+          "import-adjacent"
+        ],
+        "default": "parallel"
+      },
+      {
+        "pair": [
+          "mig-1",
+          "mig-2"
+        ],
+        "signals": [
+          "shared-risk-marker:migrations/",
+          "same-migration-app:app/billing"
+        ],
+        "default": "serialize"
+      },
+      {
+        "pair": [
+          "solo",
+          "solo-2"
+        ],
+        "signals": [
+          "import-adjacent"
+        ],
+        "default": "parallel"
+      }
+    ],
+    "tier": {
+      "types-a": "cheap",
+      "types-b": "cheap",
+      "types-c": "top",
+      "docs-d": "cheap",
+      "iface": "cheap",
+      "be": "cheap",
+      "fe": "cheap",
+      "auth-fix": "top",
+      "auth-fix-2": "top",
+      "mig-1": "top",
+      "mig-2": "top",
+      "solo": "cheap",
+      "solo-2": "cheap",
+      "blind": "cheap"
+    },
+    "verify_mode": {
+      "types-a": "offload",
+      "types-b": "offload",
+      "types-c": "offload",
+      "docs-d": "offload",
+      "iface": "offload",
+      "be": "offload",
+      "fe": "offload",
+      "auth-fix": "offload",
+      "auth-fix-2": "offload",
+      "mig-1": "offload",
+      "mig-2": "offload",
+      "solo": "offload",
+      "solo-2": "offload",
+      "blind": "offload"
+    },
+    "context_packs": {
+      "types-a": {
+        "edit": [
+          "pkg/types.ts",
+          "pkg/a.ts"
+        ]
+      },
+      "types-b": {
+        "edit": [
+          "pkg/types.ts",
+          "pkg/b.ts"
+        ]
+      },
+      "types-c": {
+        "edit": [
+          "pkg/types.ts",
+          "pkg/c.ts",
+          "docs/API.md"
+        ]
+      },
+      "docs-d": {
+        "edit": [
+          "docs/API.md",
+          "pkg/d.ts"
+        ],
+        "read": [
+          "solo/two.py"
+        ]
+      },
+      "iface": {
+        "edit": [
+          "schema.json"
+        ]
+      },
+      "be": {
+        "edit": [
+          "api/login.py"
+        ]
+      },
+      "fe": {
+        "edit": [
+          "web/Login.tsx"
+        ]
+      },
+      "auth-fix": {
+        "edit": [
+          "app/auth/route.ts"
+        ]
+      },
+      "auth-fix-2": {
+        "edit": [
+          "app/auth/session.ts"
+        ]
+      },
+      "mig-1": {
+        "edit": [
+          "app/billing/migrations/0001_x.py"
+        ]
+      },
+      "mig-2": {
+        "edit": [
+          "app/billing/migrations/0001_y.py"
+        ]
+      },
+      "solo": {
+        "edit": [
+          "solo/one.py"
+        ],
+        "read": [
+          "solo/two.py"
+        ]
+      },
+      "solo-2": {
+        "edit": [
+          "solo/two.py"
+        ],
+        "read": [
+          "pkg/d.ts",
+          "solo/one.py"
+        ]
+      },
+      "blind": {
+        "edit": []
+      }
+    },
+    "verdict_groups": [
+      {
+        "signals": [
+          "import-adjacent"
+        ],
+        "default": "parallel",
+        "count": 2,
+        "pairs": [
+          [
+            "docs-d",
+            "solo-2"
+          ],
+          [
+            "solo",
+            "solo-2"
+          ]
+        ]
+      },
+      {
+        "signals": [
+          "shared-risk-marker:migrations/",
+          "same-migration-app:app/billing"
+        ],
+        "default": "serialize",
+        "count": 1,
+        "pairs": [
+          [
+            "mig-1",
+            "mig-2"
+          ]
+        ]
+      }
+    ],
+    "coalesce": {
+      "0": [
+        [
+          "iface",
+          "solo",
+          "solo-2",
+          "blind"
+        ]
+      ],
+      "1": [
+        [
+          "types-a",
+          "docs-d"
+        ]
+      ]
+    },
+    "cluster_briefs": [
+      {
+        "cluster": 0,
+        "label": "cluster-0",
+        "msp": 0,
+        "leaves": [
+          "types-c",
+          "types-a",
+          "docs-d",
+          "types-b"
+        ],
+        "tier": "top",
+        "after_clusters": [],
+        "prompt": "You own 4 related pieces of work. Do them IN THE ORDER GIVEN - a later one may build on an earlier one.\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"types-c\",\n      \"task\": \"add type C\",\n      \"edit\": [\n        \"pkg/types.ts\",\n        \"pkg/c.ts\",\n        \"docs/API.md\"\n      ],\n      \"read\": []\n    },\n    {\n      \"name\": \"types-a\",\n      \"task\": \"add type A\",\n      \"edit\": [\n        \"pkg/types.ts\",\n        \"pkg/a.ts\"\n      ],\n      \"read\": []\n    },\n    {\n      \"name\": \"docs-d\",\n      \"task\": \"document D\",\n      \"edit\": [\n        \"docs/API.md\",\n        \"pkg/d.ts\"\n      ],\n      \"read\": [\n        \"solo/two.py\"\n      ]\n    },\n    {\n      \"name\": \"types-b\",\n      \"task\": \"add type B\",\n      \"edit\": [\n        \"pkg/types.ts\",\n        \"pkg/b.ts\"\n      ],\n      \"read\": []\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nEmit ONE such line PER LEAF, in order:\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      },
+      {
+        "cluster": 1,
+        "label": "iface",
+        "msp": 1,
+        "leaves": [
+          "iface"
+        ],
+        "tier": "cheap",
+        "after_clusters": [],
+        "prompt": "Task: pin the shape\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"iface\",\n      \"task\": \"pin the shape\",\n      \"edit\": [\n        \"schema.json\"\n      ],\n      \"read\": []\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      },
+      {
+        "cluster": 2,
+        "label": "be",
+        "msp": 1,
+        "leaves": [
+          "be"
+        ],
+        "tier": "cheap",
+        "after_clusters": [
+          1
+        ],
+        "prompt": "Task: backend half\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"be\",\n      \"task\": \"backend half\",\n      \"edit\": [\n        \"api/login.py\"\n      ],\n      \"read\": []\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      },
+      {
+        "cluster": 3,
+        "label": "fe",
+        "msp": 1,
+        "leaves": [
+          "fe"
+        ],
+        "tier": "cheap",
+        "after_clusters": [
+          1
+        ],
+        "prompt": "Task: frontend half\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"fe\",\n      \"task\": \"frontend half\",\n      \"edit\": [\n        \"web/Login.tsx\"\n      ],\n      \"read\": []\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      },
+      {
+        "cluster": 4,
+        "label": "auth-fix",
+        "msp": 2,
+        "leaves": [
+          "auth-fix"
+        ],
+        "tier": "top",
+        "after_clusters": [],
+        "prompt": "Task: fix auth\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"auth-fix\",\n      \"task\": \"fix auth\",\n      \"edit\": [\n        \"app/auth/route.ts\"\n      ],\n      \"read\": []\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      },
+      {
+        "cluster": 5,
+        "label": "auth-fix-2",
+        "msp": 3,
+        "leaves": [
+          "auth-fix-2"
+        ],
+        "tier": "top",
+        "after_clusters": [
+          4
+        ],
+        "prompt": "Task: fix auth again\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"auth-fix-2\",\n      \"task\": \"fix auth again\",\n      \"edit\": [\n        \"app/auth/session.ts\"\n      ],\n      \"read\": []\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      },
+      {
+        "cluster": 6,
+        "label": "mig-1",
+        "msp": 4,
+        "leaves": [
+          "mig-1"
+        ],
+        "tier": "top",
+        "after_clusters": [],
+        "prompt": "Task: add column\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"mig-1\",\n      \"task\": \"add column\",\n      \"edit\": [\n        \"app/billing/migrations/0001_x.py\"\n      ],\n      \"read\": []\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      },
+      {
+        "cluster": 7,
+        "label": "mig-2",
+        "msp": 5,
+        "leaves": [
+          "mig-2"
+        ],
+        "tier": "top",
+        "after_clusters": [],
+        "prompt": "Task: add other column\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"mig-2\",\n      \"task\": \"add other column\",\n      \"edit\": [\n        \"app/billing/migrations/0001_y.py\"\n      ],\n      \"read\": []\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      },
+      {
+        "cluster": 8,
+        "label": "solo",
+        "msp": 6,
+        "leaves": [
+          "solo"
+        ],
+        "tier": "cheap",
+        "after_clusters": [],
+        "prompt": "Task: solo\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"solo\",\n      \"task\": \"solo\",\n      \"edit\": [\n        \"solo/one.py\"\n      ],\n      \"read\": [\n        \"solo/two.py\"\n      ]\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      },
+      {
+        "cluster": 9,
+        "label": "solo-2",
+        "msp": 7,
+        "leaves": [
+          "solo-2"
+        ],
+        "tier": "cheap",
+        "after_clusters": [],
+        "prompt": "Task: neighbour of solo\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"solo-2\",\n      \"task\": \"neighbour of solo\",\n      \"edit\": [\n        \"solo/two.py\"\n      ],\n      \"read\": [\n        \"pkg/d.ts\",\n        \"solo/one.py\"\n      ]\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      },
+      {
+        "cluster": 10,
+        "label": "blind",
+        "msp": 8,
+        "leaves": [
+          "blind"
+        ],
+        "tier": "cheap",
+        "after_clusters": [],
+        "prompt": "Task: recon found no files\n\n{\n  \"leaves\": [\n    {\n      \"name\": \"blind\",\n      \"task\": \"recon found no files\",\n      \"edit\": [],\n      \"read\": []\n    }\n  ]\n}\n\nEdit ONLY the files listed under `edit`. Other agents are working in this tree RIGHT NOW on disjoint files; touching anything outside your edit lists will collide with them.\n\nWhen finished, print ONE line of JSON and nothing after it:\n{\"item\":\"<name>\",\"status\":\"ok\"|\"failed\",\"files_changed\":[\"path\",...],\"notes\":\"<=200 chars\"}\nKeep it short. Anything outside that line is recorded but not read back."
+      }
+    ],
+    "underspecified": [
+      "solo"
+    ],
+    "unpredicted": [
+      "blind"
+    ],
+    "plan_id": "b28c2f2810bd"
+  }
+}

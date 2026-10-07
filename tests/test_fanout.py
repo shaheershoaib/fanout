@@ -1162,5 +1162,170 @@ class ReconcileRunsAutomatically(unittest.TestCase):
         hit = [f for f in rc["findings"] if f["severity"] == "collision"][0]
         self.assertEqual((hit["item"], hit["file"]), ("one", "b/f.py"))
 
+
+TYPES = "packages/contract/src/types.ts"
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+class SharedFilesPlanning(unittest.TestCase):
+    """`--shared-files`: files many features append to, in disjoint regions. An
+    overlap that is ONLY on those must not fuse two features into one PR - the
+    edits merge with a trivial keep-both - while any other overlap fuses as ever."""
+
+    SHARED = ["types.ts"]
+
+    def two(self, extra_a=(), extra_b=()):
+        return [{"name": "a", "files": ["feat/a.ts", TYPES, *extra_a]},
+                {"name": "b", "files": ["feat/b.ts", TYPES, *extra_b]}]
+
+    def test_overlap_only_on_a_shared_file_does_not_fuse(self):
+        items = self.two()
+        self.assertEqual([sorted(g) for g in fp.msp_items(items)], [["a", "b"]])  # today
+        out = fp.plan(items, None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual(sorted(sorted(g) for g in out["msps"]), [["a"], ["b"]])
+        self.assertEqual(sorted(sorted(c) for c in out["clusters"]), [["a"], ["b"]])
+        self.assertEqual(out["cluster_after"], {})   # no serialize edge either
+        self.assertEqual(len(out["cluster_briefs"]), 2)
+
+    def test_the_pair_is_flagged_for_a_verdict_and_defaults_parallel(self):
+        out = fp.plan(self.two(), None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual(out["coupling_review"], [
+            {"pair": ["a", "b"], "signals": ["shared-file:" + TYPES],
+             "default": "parallel"}])
+
+    def test_one_signal_per_shared_file_they_share(self):
+        extra = ("docs/API.md",)
+        out = fp.plan(self.two(extra, extra), None, [], trajectories=[],
+                      shared_files=["types.ts", "API.md"])
+        self.assertEqual(out["coupling_review"][0]["signals"],
+                         ["shared-file:docs/API.md", "shared-file:" + TYPES])
+
+    def test_another_signal_that_says_serialize_still_wins(self):
+        items = [{"name": "a", "files": ["app/billing/a.py", TYPES]},
+                 {"name": "b", "files": ["app/billing/b.py", TYPES]}]
+        out = fp.plan(items, None, ["billing"], trajectories=[],
+                      shared_files=self.SHARED)
+        (entry,) = out["coupling_review"]
+        self.assertEqual(entry["signals"],
+                         ["shared-risk-marker:billing", "shared-file:" + TYPES])
+        self.assertEqual(entry["default"], "serialize")
+
+    def test_overlap_on_a_non_shared_file_still_fuses(self):
+        items = self.two(("lib/x.ts",), ("lib/x.ts",))
+        out = fp.plan(items, None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual([sorted(g) for g in out["msps"]], [["a", "b"]])
+        self.assertEqual([sorted(c) for c in out["clusters"]], [["a", "b"]])
+        self.assertEqual(out["coupling_review"], [])   # co-clustered: no verdict due
+
+    def test_a_shared_file_does_not_unfuse_a_pair_another_file_fuses(self):
+        """Three leaves: a-b share a real file, b-c only a shared one."""
+        items = [{"name": "a", "files": ["lib/x.ts"]},
+                 {"name": "b", "files": ["lib/x.ts", TYPES]},
+                 {"name": "c", "files": [TYPES]}]
+        out = fp.plan(items, None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual(sorted(sorted(g) for g in out["msps"]), [["a", "b"], ["c"]])
+
+    def test_contract_group_and_after_are_unchanged(self):
+        items = [{"name": "svc", "files": ["s.py", TYPES], "contract_group": "g"},
+                 {"name": "view", "files": ["v.py"], "contract_group": "g"},
+                 {"name": "late", "files": ["l.py", TYPES], "after": ["svc"]}]
+        out = fp.plan(items, None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual(sorted(sorted(g) for g in out["msps"]),
+                         [["late"], ["svc", "view"]])
+        self.assertEqual(sorted(sorted(c) for c in out["clusters"]),
+                         [["late"], ["svc", "view"]])
+        cid = {n: i for i, c in enumerate(out["clusters"]) for n in c}
+        self.assertEqual(out["cluster_after"], {cid["late"]: [cid["svc"]]})
+
+    def test_leaves_of_one_msp_still_share_one_cluster_on_a_shared_file(self):
+        """A declared `msp` puts leaves in ONE worktree. Two agents editing one
+        file in one tree at once is a race no merge will ever reconcile, so the
+        relaxation applies BETWEEN MSPs only."""
+        items = [{"name": "a", "files": ["a.ts", TYPES], "msp": "feature"},
+                 {"name": "b", "files": ["b.ts", TYPES], "msp": "feature"}]
+        out = fp.plan(items, None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual([sorted(g) for g in out["msps"]], [["a", "b"]])
+        self.assertEqual([sorted(c) for c in out["clusters"]], [["a", "b"]])
+
+    def test_entries_match_by_equality_suffix_or_glob(self):
+        m = fp.shared_file_matcher(["API.md", "lib/api/memory.ts", "docs/*.md",
+                                    "packages/*/src/types.ts"])
+        self.assertTrue(m("API.md"))                       # equal
+        self.assertTrue(m("apps/web/API.md"))              # ends with "/" + entry
+        self.assertTrue(m("apps/web/lib/api/memory.ts"))   # multi-segment suffix
+        self.assertTrue(m("docs/guide.md"))                # glob
+        self.assertTrue(m("packages/contract/src/types.ts"))   # glob, mid-path star
+        self.assertFalse(m("MY_API.md"))                   # not on a "/" boundary
+        self.assertFalse(m("lib/api/memory.tsx"))
+        self.assertFalse(m("other/guide.md"))
+        self.assertFalse(m("packages/contract/src/other.ts"))
+
+    def test_a_path_with_glob_characters_matches_literally(self):
+        """Next.js route segments are `[claimId]` and `(internal)`; the glob
+        reading of those must not stop the literal path matching itself."""
+        route = "app/(internal)/crm/[claimId]/ClaimDetailView.tsx"
+        m = fp.shared_file_matcher([route])
+        self.assertTrue(m(route))
+        self.assertTrue(m("apps/web/" + route))
+
+    def test_no_entries_means_nothing_is_shared(self):
+        for empty in (None, [], ["", "  "]):
+            self.assertFalse(fp.shared_file_matcher(empty)("anything.ts"))
+
+    def test_a_planned_run_echoes_the_entries_and_a_plain_one_does_not(self):
+        on = fp.plan(self.two(), None, [], trajectories=[], shared_files=[" types.ts "])
+        self.assertEqual(on["shared_files"], ["types.ts"])
+        off = fp.plan(self.two(), None, [], trajectories=[])
+        self.assertNotIn("shared_files", off)
+        self.assertNotIn("integration_order", off)
+
+
+class NoSharedFilesIsUnchanged(unittest.TestCase):
+    """Without the flag the plan is what it was before the feature existed. The
+    golden file was produced by the pre-feature planner (origin/main at 8de9992)."""
+
+    def setUp(self):
+        with open(os.path.join(FIXTURES, "plan_without_shared_files.json"),
+                  encoding="utf-8") as f:
+            self.golden = json.load(f)
+        self.tmp = tempfile.mkdtemp()
+        self.graph = os.path.join(self.tmp, "graph.json")
+        with open(self.graph, "w", encoding="utf-8") as f:
+            json.dump(self.golden["graph"], f)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def plan(self, **kw):
+        return fp.plan(self.golden["items"], self.graph,
+                       self.golden["risk_markers"], trajectories=[], **kw)
+
+    def test_plan_is_byte_identical_to_the_pre_feature_plan(self):
+        want = json.dumps(self.golden["plan"], indent=2)
+        self.assertEqual(json.dumps(self.plan(), indent=2), want)
+        self.assertEqual(json.dumps(self.plan(shared_files=None), indent=2), want)
+        self.assertEqual(json.dumps(self.plan(shared_files=[]), indent=2), want)
+
+    def test_cli_output_is_byte_identical_to_the_pre_feature_plan(self):
+        items = os.path.join(self.tmp, "items.json")
+        with open(items, "w", encoding="utf-8") as f:
+            json.dump(self.golden["items"], f)
+        proc = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(fp.__file__), "fanout.py"),
+             "--items", items, "--graph", self.graph, "--no-trajectories",
+             "--risk-markers", ",".join(self.golden["risk_markers"])],
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, json.dumps(self.golden["plan"], indent=2) + "\n")
+
+    def test_a_flag_that_matches_nothing_changes_only_its_own_echo(self):
+        got = json.loads(json.dumps(self.plan(shared_files=["no-such-file.ts"])))
+        self.assertEqual(got.pop("shared_files"), ["no-such-file.ts"])
+        self.assertNotEqual(got.pop("plan_id"), self.golden["plan"]["plan_id"])
+        want = dict(self.golden["plan"])
+        want.pop("plan_id")
+        self.assertEqual(got, want)
+
+
 if __name__ == "__main__":
     unittest.main()
