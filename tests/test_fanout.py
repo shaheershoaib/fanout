@@ -1500,9 +1500,96 @@ class SharedFilesExec(unittest.TestCase):
         self.assertNotIn("reconcile", res)
 
 
+class SharedFileCandidates(unittest.TestCase):
+    """Advice, never applied: which undeclared files, declared shared one after
+    another, would split the batch into more MSPs. The walk is CUMULATIVE because
+    a real batch is fused by several such files at once, and no one of them alone
+    splits anything."""
+
+    def plan(self, items, shared=None):
+        return fp.plan(items, None, [], trajectories=[], shared_files=shared)
+
+    def three(self, *files):
+        return [{"name": n, "files": [n + ".ts", *files]} for n in "abc"]
+
+    def test_two_files_that_each_fuse_the_same_three_items(self):
+        items = self.three("reg.ts", "doc.md")
+        for f in ("reg.ts", "doc.md"):   # neither alone splits anything
+            self.assertEqual(len(fp.msp_items(items, [f])), 1)
+        out = self.plan(items)
+        self.assertEqual(out["shared_file_candidates"], {"msps_now": 1, "files": [
+            {"file": "doc.md", "items": 3, "msps_after": 1},
+            {"file": "reg.ts", "items": 3, "msps_after": 3}]})
+        self.assertEqual([sorted(g) for g in out["msps"]], [["a", "b", "c"]])  # advice only
+        self.assertEqual([sorted(c) for c in out["clusters"]], [["a", "b", "c"]])
+
+    def test_a_file_only_two_items_predict_is_never_walked(self):
+        pair = [{"name": "x", "files": ["x.ts", "pair.ts"]},
+                {"name": "y", "files": ["y.ts", "pair.ts"]}]
+        self.assertNotIn("shared_file_candidates", self.plan(pair))
+        out = self.plan(self.three("reg.ts") + pair)
+        self.assertEqual(out["shared_file_candidates"], {"msps_now": 2, "files": [
+            {"file": "reg.ts", "items": 3, "msps_after": 4}]})
+
+    def test_a_declared_file_is_never_walked(self):
+        items = self.three("reg.ts", "doc.md")
+        out = self.plan(items, shared=["doc.md"])
+        self.assertEqual(out["shared_file_candidates"], {"msps_now": 1, "files": [
+            {"file": "reg.ts", "items": 3, "msps_after": 3}]})
+        self.assertNotIn("shared_file_candidates",
+                         self.plan(items, shared=["doc.md", "reg.ts"]))
+
+    def test_a_walk_where_no_step_raises_the_count_emits_no_key(self):
+        chained = [{"name": "a", "files": ["reg.ts", "ab.py"]},
+                   {"name": "b", "files": ["reg.ts", "ab.py", "bc.py"]},
+                   {"name": "c", "files": ["reg.ts", "bc.py"]}]
+        grouped = [dict(it, contract_group="g") for it in self.three("reg.ts")]
+        for items in (chained, grouped):
+            out = self.plan(items)
+            self.assertNotIn("shared_file_candidates", out)
+            self.assertEqual(len(out["msps"]), 1)
+
+    def test_the_prefix_stops_at_the_last_raising_step(self):
+        def group(names, f, **kw):
+            return [dict({"name": n, "files": [n + ".py", f]}, **kw) for n in names]
+        items = (group("pqrs", "x.reg")                        # 4 items: walked first
+                 + group("abc", "a.reg")
+                 + group("ghi", "m.reg", contract_group="g")   # fused anyway: no raise
+                 + group("def", "q.reg")
+                 + group("uvw", "z.reg", contract_group="h"))  # trailing, no raise
+        out = self.plan(items)
+        self.assertEqual(out["shared_file_candidates"], {"msps_now": 5, "files": [
+            {"file": "x.reg", "items": 4, "msps_after": 8},
+            {"file": "a.reg", "items": 3, "msps_after": 10},
+            {"file": "m.reg", "items": 3, "msps_after": 10},
+            {"file": "q.reg", "items": 3, "msps_after": 12}]})
+
+    def test_the_prefix_is_capped_at_twenty(self):
+        items = [{"name": "%s-%02d" % (n, k), "files": ["%s-%02d.py" % (n, k),
+                                                       "f%02d.ts" % k]}
+                 for k in range(21) for n in "abc"]
+        files = self.plan(items)["shared_file_candidates"]["files"]
+        self.assertEqual(len(files), 20)
+        self.assertEqual([e["file"] for e in files], ["f%02d.ts" % k for k in range(20)])
+        self.assertEqual(files[-1]["msps_after"], 21 + 2 * 20)
+
+
 class NoSharedFilesIsUnchanged(unittest.TestCase):
     """Without the flag the plan is what it was before the feature existed. The
-    golden file was produced by the pre-feature planner (origin/main at 8de9992)."""
+    golden file was produced by the pre-feature planner (origin/main at 8de9992).
+    Its input has three leaves on `pkg/types.ts`, so the plan has since gained ONE
+    advisory key, `shared_file_candidates` (and so a new plan_id); every other byte
+    is still the golden one."""
+
+    CANDIDATES = {"msps_now": 9, "files": [
+        {"file": "pkg/types.ts", "items": 3, "msps_after": 11}]}
+
+    def unchanged_but_for_candidates(self, got):
+        self.assertEqual(got.pop("shared_file_candidates"), self.CANDIDATES)
+        self.assertNotEqual(got.pop("plan_id"), self.golden["plan"]["plan_id"])
+        want = dict(self.golden["plan"])
+        want.pop("plan_id")
+        self.assertEqual(json.dumps(got, indent=2), json.dumps(want, indent=2))
 
     def setUp(self):
         with open(os.path.join(FIXTURES, "plan_without_shared_files.json"),
@@ -1520,13 +1607,11 @@ class NoSharedFilesIsUnchanged(unittest.TestCase):
         return fp.plan(self.golden["items"], self.graph,
                        self.golden["risk_markers"], trajectories=[], **kw)
 
-    def test_plan_is_byte_identical_to_the_pre_feature_plan(self):
-        want = json.dumps(self.golden["plan"], indent=2)
-        self.assertEqual(json.dumps(self.plan(), indent=2), want)
-        self.assertEqual(json.dumps(self.plan(shared_files=None), indent=2), want)
-        self.assertEqual(json.dumps(self.plan(shared_files=[]), indent=2), want)
+    def test_plan_is_the_pre_feature_plan_plus_only_the_candidates(self):
+        for kw in ({}, {"shared_files": None}, {"shared_files": []}):
+            self.unchanged_but_for_candidates(self.plan(**kw))
 
-    def test_cli_output_is_byte_identical_to_the_pre_feature_plan(self):
+    def test_cli_output_is_the_pre_feature_plan_plus_only_the_candidates(self):
         items = os.path.join(self.tmp, "items.json")
         with open(items, "w", encoding="utf-8") as f:
             json.dump(self.golden["items"], f)
@@ -1536,15 +1621,14 @@ class NoSharedFilesIsUnchanged(unittest.TestCase):
              "--risk-markers", ",".join(self.golden["risk_markers"])],
             capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout, json.dumps(self.golden["plan"], indent=2) + "\n")
+        got = json.loads(proc.stdout)
+        self.assertEqual(proc.stdout, json.dumps(got, indent=2) + "\n")
+        self.unchanged_but_for_candidates(got)
 
     def test_a_flag_that_matches_nothing_changes_only_its_own_echo(self):
         got = json.loads(json.dumps(self.plan(shared_files=["no-such-file.ts"])))
         self.assertEqual(got.pop("shared_files"), ["no-such-file.ts"])
-        self.assertNotEqual(got.pop("plan_id"), self.golden["plan"]["plan_id"])
-        want = dict(self.golden["plan"])
-        want.pop("plan_id")
-        self.assertEqual(got, want)
+        self.unchanged_but_for_candidates(got)
 
 
 if __name__ == "__main__":

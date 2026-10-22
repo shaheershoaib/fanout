@@ -97,6 +97,7 @@ It returns:
 | `context_packs` | the files each task should read, so an agent is not left hunting |
 | `coupling_review` | file-disjoint pairs that still carry a coupling signal |
 | `integration_order` | with `--shared-files`: for each shared file two or more MSPs edit, the order to merge them in |
+| `shared_file_candidates` | files that, declared with `--shared-files`, would split the batch into more MSPs: a suggestion, never applied |
 | `verdict_groups` | those pairs bucketed, so one ruling covers many |
 | `coalesce` | small tasks cheaper merged into one worker than spawned separately |
 | `shared_context` | files several tasks would each read — read once, share the digest |
@@ -156,9 +157,26 @@ Use it for files many features append to or edit in disjoint regions. **Never**
 for a file whose shared lines carry one contract: two features that must agree on
 the same lines belong in one MSP, and declaring that file shared hides it.
 
+**Not sure which files they are?** The plan suggests them in
+`shared_file_candidates`. It walks the undeclared files three or more leaves
+predict, most-predicted first (then by path), adds each to a trial declared list on
+top of `--shared-files`, and recomputes the MSP count after each step. The walk is
+cumulative because a batch is usually fused by several such files at once, and no
+one of them alone splits anything. It reports `msps_now` (the count with only the
+declared list) and `files`: the walk up to and including the last step that raised
+the count, each step as `{file, items, msps_after}`, at most 20. A step whose
+`msps_after` did not rise is still listed, because a later split needs it declared
+too. The key is absent when no step raises the count.
+
+It is a suggestion and is never applied: `msps`, `clusters`, tiers and everything
+else are computed as if it were absent. fanout cannot tell edits in separate
+regions from edits to one shared contract, so before declaring a candidate, read
+what each leaf predicts to change in it. Declare it only when the features edit it
+in separate places; never when its shared lines carry one contract.
+
 Without `--shared-files` the output is byte-identical to a plan computed without
-the feature; the plan echoes `shared_files` when given, so a saved plan executes
-the same way later.
+the feature, apart from `shared_file_candidates` when the walk finds a split; the
+plan echoes `shared_files` when given, so a saved plan executes the same way later.
 
 ## Running the plan
 
@@ -254,7 +272,8 @@ recon derived so you can correct it before anything is built.
   `types/AuthResponse.ts` and `app/auth/route.ts` but not `(unauthenticated)`. A
   marker containing a separator (`api/auth`, `.sql`) is read as a path fragment.
 - `--shared-files`: files many features edit in disjoint regions; an overlap only
-  there does not fuse MSPs, and `integration_order` says how to merge them. See
+  there does not fuse MSPs, and `integration_order` says how to merge them.
+  `shared_file_candidates` suggests entries. See
   [Shared files](#shared-files-build-in-parallel-integrate-in-order).
 - `--serial-verify-markers` — surfaces whose verification needs a real session.
 - `--trajectories` — a JSONL history store, if you keep one. Strictly additive:
@@ -267,7 +286,7 @@ recon derived so you can correct it before anything is built.
 python3 -m unittest discover -s tests
 ```
 
-144 tests, covering the scheduling algebra, the safety invariants, shared files, and
+150 tests, covering the scheduling algebra, the safety invariants, shared files, and
 the runner
 (including that a prompt full of shell metacharacters stays one argument).
 
