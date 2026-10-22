@@ -181,7 +181,8 @@ boundaries only.
   disjoint regions: type registries, test registries, API docs, a very large
   screen component; never a file whose shared lines carry one contract. The
   features build in parallel and integrate in `integration_order`, reading the
-  hunks both sides changed in that file at each step.
+  hunks both sides changed in that file at each step. Not sure which files? Plan
+  without it first and read `shared_file_candidates`.
 - `--trajectories`: (optional) a trajectory-memory JSONL store, if the setup
   provides one. Defaults to the global store when present and is read
   automatically, so the plan is HISTORY-AWARE: a surface with a bad track record
@@ -256,6 +257,17 @@ Output JSON:
   in that file. Dependency order first (an MSP after its producers), then the
   critical-path priority, then input order.
 - `shared_files`: the declared entries, echoed so a saved plan executes the same.
+- `shared_file_candidates`: (only when a step of its walk raises the MSP count;
+  with or without `--shared-files`) a SUGGESTION of files to declare, never
+  applied - nothing else in the plan is computed from it. `{msps_now, files:
+  [{file, items, msps_after}, ...]}`: undeclared files 3+ leaves predict,
+  most-predicted first then path, each declared on top of the list and the ones
+  before it, up to and including the last step that raised the count (cap 20).
+  Cumulative because several such files usually fuse the same leaves and no one
+  of them alone splits anything, so a step whose `msps_after` did not rise is
+  still needed. Before declaring one, READ what each leaf predicts to change in
+  it: declare it only when the features edit it in separate places, never when
+  its shared lines carry one contract (those leaves belong in one MSP).
 - `tier`: per item, `top` or `cheap` (map to your models, e.g. top=Opus, cheap=Sonnet).
   A path-marker match forces `top`; trajectory memory ALSO forces `top` for a surface
   with a bad track record (a recorded revert, a speculative ship, a caused-regression,

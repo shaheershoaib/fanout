@@ -26,7 +26,8 @@ there fuses nothing (no MSP, cluster or serialize edge); the pair is flagged in
 coupling_review as `shared-file:<path>` and `integration_order` says in which
 order the MSPs editing each such file are to be merged, reading both sides' hunks
 at each step. Overlap on any other file fuses exactly as before, and without the
-flag the output is unchanged.
+flag the output is unchanged except that `shared_file_candidates` may SUGGEST
+files to declare. It is never applied.
 
 The graph is a HINT, not a merge-safety oracle: file-level granularity; may be
 stale; blind to the cross-repo API contract. The orchestrator still reviews
@@ -359,6 +360,41 @@ def integration_order(items, msps, shared_files):
         return {}
     rank = msp_rank(items, msps)
     return {f: sorted(multi[f], key=rank.__getitem__) for f in sorted(multi)}
+
+
+def shared_file_candidates(items, shared_files, min_items=3, cap=20):
+    """ADVICE, never applied: undeclared files that, declared shared, would split
+    the batch into more MSPs. fanout cannot tell edits in disjoint regions from
+    edits to one shared contract, and declaring the second kind turns one MSP into
+    two PRs that collide, so it only suggests; the caller reads the predicted
+    edits and decides.
+
+    The walk is CUMULATIVE, because a real batch is fused by several such files at
+    once and no one of them alone splits anything. Files `min_items` or more leaves
+    predict, most-predicted first (then path), are added one at a time to a trial
+    declared set on top of `shared_files`, recomputing the MSP count after each.
+    Reported: that walk up to and including the LAST step that raised the count,
+    capped at `cap`. None when no step raises it."""
+    is_shared = shared_file_matcher(shared_files)
+    count = defaultdict(int)
+    for it in items:
+        for f in set(it["files"]):
+            if not is_shared(f):
+                count[f] += 1
+    walk = sorted((f for f, n in count.items() if n >= min_items),
+                  key=lambda f: (-count[f], f))
+    msps_now = prev = len(msp_items(items, shared_files))
+    trial, steps, last = list(shared_files), [], 0
+    for f in walk:
+        trial.append(f)
+        after = len(msp_items(items, trial))
+        steps.append({"file": f, "items": count[f], "msps_after": after})
+        if after > prev:
+            last = len(steps)
+        prev = after
+    if not last:
+        return None
+    return {"msps_now": msps_now, "files": steps[:min(last, cap)]}
 
 
 def _conflict_adjacency(items, shared_files=None):
@@ -878,7 +914,8 @@ def plan(items, graph_path, risk_markers, trajectories=None,
     shared_files is OPTIONAL: path entries (see shared_file_matcher) for files
     many features edit in disjoint regions. An overlap only there fuses nothing;
     the plan then carries `shared_files` (the echo, so a saved plan executes the
-    same way) and `integration_order`. Without it the plan is unchanged."""
+    same way) and `integration_order`. Without it the plan is unchanged, apart
+    from the advisory `shared_file_candidates`."""
     seen_names, dupes = set(), set()
     for it in items:
         (dupes if it["name"] in seen_names else seen_names).add(it["name"])
@@ -937,6 +974,9 @@ def plan(items, graph_path, risk_markers, trajectories=None,
         order = integration_order(items, msps, shared_files)
         if order:
             result["integration_order"] = order
+    candidates = shared_file_candidates(items, shared_files)
+    if candidates:  # advice only: nothing in the plan is computed from it
+        result["shared_file_candidates"] = candidates
     for key, value in (("verdict_groups", verdict_groups(review)),
                        ("shared_context", shared_context(packs, waves)),
                        ("coalesce", coalesce_groups(items, waves, tier, cost,

@@ -233,10 +233,24 @@ serialize into one cluster on a shared file.
   order; they keep a repeatable one and the plan is not refused.
 - `shared_files` echoes the declared entries, so a saved plan run later with
   `--plan-file` reconciles the same way.
+- `shared_file_candidates` suggests entries, with or without the flag. Undeclared
+  files that three or more leaves predict, most-predicted first then by path, are
+  added one at a time to a trial declared set on top of the declared list, and the
+  MSP count is recomputed after each. It carries `msps_now` (the count with only
+  the declared list) and `files`: that walk up to and including the last step that
+  raised the count, each step `{file, items, msps_after}`, capped at 20. The walk
+  is cumulative because several such files usually fuse the same leaves and no one
+  of them alone splits anything: on a real batch, fifteen leaves sat in three MSPs,
+  no single file moved the count, and fourteen declared in turn gave six. It is
+  advice: nothing in the plan is computed from it. Before declaring one, read what
+  each leaf predicts to change in that file; declare it only when the features
+  edit it in separate places, never when its shared lines carry one contract.
 
-Both new keys are present only when the flag is given (`integration_order` only
-when some shared file is edited by two or more MSPs). Without the flag the output
-is byte-identical to a plan computed without this feature.
+`shared_files` and `integration_order` are present only when the flag is given
+(`integration_order` only when some shared file is edited by two or more MSPs);
+`shared_file_candidates` only when a step of its walk raises the count. Without
+the flag and with no candidates, the output is byte-identical to a plan computed
+without this feature.
 
 **Reconcile.** A cluster that touches a file recon did not predict, which another
 MSP did, is a collision and fails the run. If that file is a declared shared file
