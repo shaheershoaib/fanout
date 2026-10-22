@@ -20,6 +20,14 @@ store, or --no-trajectories, the output is identical to the marker-only plan.
 History only ever ADDS caution - it bumps a tier UP and adds serialize hints; it
 never relaxes a tier or removes a coupling signal.
 
+shared_files (--shared-files): files many features edit in DISJOINT regions - type
+registries, test registries, an API doc, a huge screen component. An overlap ONLY
+there fuses nothing (no MSP, cluster or serialize edge); the pair is flagged in
+coupling_review as `shared-file:<path>` and `integration_order` says in which
+order the MSPs editing each such file are to be merged, reading both sides' hunks
+at each step. Overlap on any other file fuses exactly as before, and without the
+flag the output is unchanged.
+
 The graph is a HINT, not a merge-safety oracle: file-level granularity; may be
 stale; blind to the cross-repo API contract. The orchestrator still reviews
 diffs AND renders the coupling_review verdicts.
@@ -40,6 +48,7 @@ verify_mode: whether a leaf's check needs the orchestrator's own session or can
 be offloaded. Scheduling is makespan-aware: longest remaining chain first.
 """
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -93,17 +102,41 @@ def _item_graph_files(file_paths, adj_keys):
     return {k for f in file_paths for k in adj_keys if _paths_match(f, k)}
 
 
-def msp_items(items):
+def shared_file_matcher(entries):
+    """A predicate: is this path one of the declared SHARED files?
+
+    A shared file is one many features append to or edit in DISJOINT regions - a
+    type registry, a test registry, an API doc, a very large screen component.
+    Two leaves overlapping ONLY there merge with a trivial keep-both, so the
+    overlap must not fuse them into one PR (see `integration_order`).
+
+    An entry matches a path when the path EQUALS it, ENDS WITH "/" + entry (so a
+    bare name or a repo-relative path matches under any prefix), or matches it as
+    an fnmatch glob over the whole path. Equality and suffix are tried first, so a
+    path made of glob metacharacters - Next.js `app/(x)/[id]/page.tsx` - still
+    matches itself. No entries -> nothing is shared."""
+    entries = [e.strip() for e in (entries or []) if e and e.strip()]
+
+    def is_shared(path):
+        return any(path == e or path.endswith("/" + e)
+                   or fnmatch.fnmatchcase(path, e) for e in entries)
+    return is_shared
+
+
+def msp_items(items, shared_files=None):
     """Group items into MSPs - the unit that becomes one branch and one PR.
 
     Items are unioned when they MUST serialize: a shared edited file, or a
     declared contract_group (two halves of one contract, even when their edited
     files are disjoint). Distinct MSPs are file- and contract-disjoint, so two
-    open PRs never touch the same file.
+    open PRs never touch the same file - except on a declared `shared_files`
+    entry, which never fuses anything: such a file is edited by several MSPs on
+    purpose and integrated in a fixed order instead.
 
     This does not DEFINE an MSP boundary - recon does that, semantically. This
     only FUSES two that turn out to collide, because a cluster converges into
     one branch and so cannot span two MSPs."""
+    is_shared = shared_file_matcher(shared_files)
     parent = {it["name"]: it["name"] for it in items}
 
     def find(x):
@@ -118,6 +151,8 @@ def msp_items(items):
     owner, group_owner, msp_owner = {}, {}, {}
     for it in items:
         for f in it["files"]:
+            if is_shared(f):
+                continue
             if f in owner:
                 union(it["name"], owner[f])
             else:
@@ -162,7 +197,7 @@ def _pinned_contract_groups(items):
     return pinned
 
 
-def cluster_items(items):
+def cluster_items(items, shared_files=None):
     """Partition items into CLUSTERS: the unit one agent owns and walks
     sequentially.
 
@@ -170,7 +205,10 @@ def cluster_items(items):
     edges are the two things that force two leaves not to run concurrently:
 
       - a shared edited file, or an UNPINNED contract_group  (undirected: they
-        must not run at once, but either order is fine)
+        must not run at once, but either order is fine). A declared
+        `shared_files` entry is no edge BETWEEN MSPs. Inside one MSP it still is,
+        because that MSP's clusters share ONE worktree: two agents editing one
+        file in one tree at once is a race no merge reconciles.
       - a declared `after` edge                              (directed: one
         genuinely needs the other's output)
 
@@ -193,8 +231,9 @@ def cluster_items(items):
         if ra != rb:
             parent[ra] = rb
 
+    is_shared = shared_file_matcher(shared_files)
     msp_of = {}
-    for group in msp_items(items):
+    for group in msp_items(items, shared_files):
         for n in group:
             msp_of[n] = group[0]
 
@@ -203,10 +242,12 @@ def cluster_items(items):
     by_name = {it["name"]: it for it in items}
     for it in items:
         for f in it["files"]:
-            if f in owner:
-                union(it["name"], owner[f])
+            # a shared file only collides with leaves of the SAME MSP
+            key = (f, msp_of[it["name"]]) if is_shared(f) else f
+            if key in owner:
+                union(it["name"], owner[key])
             else:
-                owner[f] = it["name"]
+                owner[key] = it["name"]
         g = it.get("contract_group")
         if g and g not in pinned:
             if g in group_owner:
@@ -262,12 +303,73 @@ def cluster_after(items, clusters):
     return {i: sorted(v) for i, v in out.items() if v}
 
 
-def _conflict_adjacency(items):
+def msp_rank(items, msps):
+    """Where each MSP (by index into `msps`) sits in ONE total order: the order
+    to integrate them in.
+
+    Dependency order first - an MSP follows every MSP that holds a producer of
+    one of its leaves, which is a per-MSP fact, not a per-leaf one - then the same
+    critical-path priority the schedule uses (longest remaining chain first), then
+    input order, so the answer is deterministic.
+
+    Item-level `after` is acyclic, but two MSPs can each hold a producer of the
+    other. That is not an error here: its members keep the best position the sort
+    gives them, and the order only has to be repeatable."""
+    msp_of = {n: i for i, g in enumerate(msps) for n in g}
+    chain = downstream_cost(items, {it["name"]: item_cost(it) for it in items})
+    priority = {i: max(chain[n] for n in g) for i, g in enumerate(msps)}
+    producers, consumers = defaultdict(set), defaultdict(set)
+    for it in items:
+        for dep in (it.get("after") or []):
+            a, b = msp_of[dep], msp_of[it["name"]]
+            if a != b:
+                producers[b].add(a)
+                consumers[a].add(b)
+    floor = {i: 0 for i in range(len(msps))}
+    waiting = {i: len(producers[i]) for i in floor}
+    queue = [i for i in floor if not waiting[i]]
+    qi = 0
+    while qi < len(queue):
+        i = queue[qi]
+        qi += 1
+        for c in consumers[i]:
+            floor[c] = max(floor[c], floor[i] + 1)
+            waiting[c] -= 1
+            if not waiting[c]:
+                queue.append(c)
+    ranked = sorted(floor, key=lambda i: (floor[i], -priority[i], i))
+    return {m: pos for pos, m in enumerate(ranked)}
+
+
+def integration_order(items, msps, shared_files):
+    """For each shared file that TWO OR MORE MSPs edit, those MSPs (indices into
+    `msps`) in the order to integrate them: merge or rebase them in this order,
+    and at each step READ the hunks both sides changed in that file. The edits are
+    expected to merge with a trivial keep-both; the order makes the one place
+    they might not a fixed, repeatable walk instead of whoever merges first."""
+    is_shared = shared_file_matcher(shared_files)
+    msp_of = {n: i for i, g in enumerate(msps) for n in g}
+    editors = defaultdict(set)
+    for it in items:
+        for f in it["files"]:
+            if is_shared(f):
+                editors[f].add(msp_of[it["name"]])
+    multi = {f: m for f, m in editors.items() if len(m) > 1}
+    if not multi:
+        return {}
+    rank = msp_rank(items, msps)
+    return {f: sorted(multi[f], key=rank.__getitem__) for f in sorted(multi)}
+
+
+def _conflict_adjacency(items, shared_files=None):
     """name -> set of names it MUST serialize with: shared edited file OR shared
     contract_group (the same keys cluster_items unions on, kept pairwise here so
-    waves can see WHICH items inside a cluster actually conflict)."""
+    waves can see WHICH items inside a cluster actually conflict). A declared
+    shared file is no conflict."""
+    is_shared = shared_file_matcher(shared_files)
     names = [it["name"] for it in items]
-    files = {it["name"]: set(it["files"]) for it in items}
+    files = {it["name"]: {f for f in it["files"] if not is_shared(f)}
+             for it in items}
     group = {it["name"]: it.get("contract_group") for it in items}
     adj = {n: set() for n in names}
     for i in range(len(names)):
@@ -517,7 +619,8 @@ def _migration_apps(file_paths):
     return apps
 
 
-def coupling_review(items, adj, risk_markers, trajectories=None):
+def coupling_review(items, adj, risk_markers, trajectories=None,
+                    shared_files=None):
     """For each file-disjoint, NOT-co-clustered pair, surface soft coupling
     signals that warrant an explicit parallelize-vs-serialize verdict before
     dispatch (the ORCHESTRATOR renders the verdict; this flags + defaults only):
@@ -528,10 +631,15 @@ def coupling_review(items, adj, risk_markers, trajectories=None):
       - same-migration-app:<A>: both add a migration to the same app's migrations/
                                 dir -> parallel builds collide on the migration
                                 number (default 'serialize')
+      - shared-file:<path>:     they overlap on a DECLARED shared file (one signal
+                                per such file); the overlap did not fuse them, so
+                                the verdict is whether the two regions are really
+                                disjoint. Never decides the default on its own.
     default 'serialize' when they share a risk-marker, have a recorded regression,
     or would collide on a migration number (likely halves of one contract / known
     to break each other / a guaranteed rebase conflict); else 'parallel'.
     Signal-free pairs are omitted (auto-parallel)."""
+    is_shared = shared_file_matcher(shared_files)
     names = [it["name"] for it in items]
     by_name = {it["name"]: it for it in items}
     files = {it["name"]: set(it["files"]) for it in items}
@@ -540,7 +648,7 @@ def coupling_review(items, adj, risk_markers, trajectories=None):
     matched = ({n: [e for e in trajectories if _entry_matches_item(e, by_name[n])] for n in names}
                if trajectories else {n: [] for n in names})
     co = set()
-    for c in cluster_items(items):
+    for c in cluster_items(items, shared_files):
         for i in range(len(c)):
             for j in range(i + 1, len(c)):
                 co.add(frozenset((c[i], c[j])))
@@ -548,7 +656,8 @@ def coupling_review(items, adj, risk_markers, trajectories=None):
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             a, b = names[i], names[j]
-            if frozenset((a, b)) in co or files[a] & files[b]:
+            overlap = files[a] & files[b]
+            if frozenset((a, b)) in co or any(not is_shared(f) for f in overlap):
                 continue
             signals = []
             if any(bf in adj.get(af, ()) for af in gfiles[a] for bf in gfiles[b]):
@@ -563,6 +672,7 @@ def coupling_review(items, adj, risk_markers, trajectories=None):
                 signals.append("regression-history")
             mig = sorted(_migration_apps(files[a]) & _migration_apps(files[b]))
             signals += ["same-migration-app:" + (m or "<root>") for m in mig]
+            signals += ["shared-file:" + f for f in sorted(overlap)]
             if signals:
                 out.append({"pair": [a, b], "signals": signals,
                             "default": "serialize" if (shared or regression or mig) else "parallel"})
@@ -630,7 +740,7 @@ def tier_for(file_paths, risk_markers, complexity=None):
     return "cheap"
 
 
-def ready_after(items, waves):
+def ready_after(items, waves, shared_files=None):
     """Per item, the items that must INTEGRATE before it can start: its declared
     `after` producers, plus any item it CONFLICTS with that the schedule placed
     earlier. This is the dependency DAG the waves flatten. A consumer that honors
@@ -639,7 +749,7 @@ def ready_after(items, waves):
     member of the wave before it. Same safety, less idling: an item never starts
     before anything it shares a file (or a contract_group) with."""
     after = _after_edges(items)
-    adj = _conflict_adjacency(items)
+    adj = _conflict_adjacency(items, shared_files)
     wave_of = {n: i for i, w in enumerate(waves) for n in w}
     out = {}
     for it in items:
@@ -761,9 +871,14 @@ def verify_modes(items, serial_markers):
 
 def plan(items, graph_path, risk_markers, trajectories=None,
          serial_verify_markers=None, context_hops=1, context_cap=40,
-         coalesce_below=2.0, coalesce_max=4, briefs=True):
+         coalesce_below=2.0, coalesce_max=4, briefs=True, shared_files=None):
     """graph_path is OPTIONAL (None -> no import-adjacency signals; clustering,
-    waves, tiers, and the marker/history coupling signals still compute)."""
+    waves, tiers, and the marker/history coupling signals still compute).
+
+    shared_files is OPTIONAL: path entries (see shared_file_matcher) for files
+    many features edit in disjoint regions. An overlap only there fuses nothing;
+    the plan then carries `shared_files` (the echo, so a saved plan executes the
+    same way) and `integration_order`. Without it the plan is unchanged."""
     seen_names, dupes = set(), set()
     for it in items:
         (dupes if it["name"] in seen_names else seen_names).add(it["name"])
@@ -778,6 +893,7 @@ def plan(items, graph_path, risk_markers, trajectories=None,
     else:
         adj = {}
     trajectories = trajectories or []
+    shared_files = [e.strip() for e in (shared_files or []) if e and e.strip()]
     tier, tier_notes = {}, {}
     for it in items:
         t = tier_for(it["files"], risk_markers, it.get("complexity"))
@@ -787,23 +903,24 @@ def plan(items, graph_path, risk_markers, trajectories=None,
                 t = "top"
                 tier_notes[it["name"]] = "history: " + reason
         tier[it["name"]] = t
-    conflict_adj = _conflict_adjacency(items)
+    conflict_adj = _conflict_adjacency(items, shared_files)
     order_index = {it["name"]: i for i, it in enumerate(items)}
     decided = _after_connected(items)
-    review = [p for p in coupling_review(items, adj, risk_markers, trajectories)
+    review = [p for p in coupling_review(items, adj, risk_markers, trajectories,
+                                         shared_files)
               if frozenset(p["pair"]) not in decided]
     cost = {it["name"]: item_cost(it) for it in items}
     waves = global_waves(items, conflict_adj, order_index,
                          downstream_cost(items, cost))
     packs = context_packs(items, adj, context_hops, context_cap)
-    deps = ready_after(items, waves)
-    msps = msp_items(items)
+    deps = ready_after(items, waves, shared_files)
+    msps = msp_items(items, shared_files)
     # Each cluster's members are stored in the order its agent must walk them.
     # Carrying the order IN the cluster is what stops a second consumer having
     # to re-derive it from a schedule - and the schedule is not emitted.
     seq = {n: i for i, n in enumerate(n for w in waves for n in w)}
     clusters = [sorted(c, key=lambda n: seq.get(n, len(seq)))
-                for c in cluster_items(items)]
+                for c in cluster_items(items, shared_files)]
     result = {
         "msps": msps,
         "clusters": clusters,
@@ -815,6 +932,11 @@ def plan(items, graph_path, risk_markers, trajectories=None,
     }
     if tier_notes:  # only present when history actually bumped something
         result["tier_notes"] = tier_notes
+    if shared_files:  # only present when the caller declared any
+        result["shared_files"] = shared_files
+        order = integration_order(items, msps, shared_files)
+        if order:
+            result["integration_order"] = order
     for key, value in (("verdict_groups", verdict_groups(review)),
                        ("shared_context", shared_context(packs, waves)),
                        ("coalesce", coalesce_groups(items, waves, tier, cost,
@@ -868,7 +990,7 @@ def plan(items, graph_path, risk_markers, trajectories=None,
     return result
 
 
-def reconcile(items, clusters, actual_files):
+def reconcile(items, clusters, actual_files, shared_files=None):
     """Check the prediction the whole plan rests on.
 
     v2 derives merge safety from files recon PREDICTED, which is a guess. This
@@ -879,10 +1001,17 @@ def reconcile(items, clusters, actual_files):
     unit that ships together. A miss that lands in ANOTHER MSP's file set means
     two MSPs were not disjoint after all and the plan parallelized a real
     collision. That is the finding; it is reported loudly rather than inferred
-    later from a merge conflict."""
+    later from a merge conflict.
+
+    The exception is a DECLARED shared file (`shared_files`): several MSPs edit
+    it on purpose and integrate in `integration_order`, so a cross-MSP touch of
+    one is reported as severity `shared-file` - with the order to integrate in -
+    and is neither a collision nor a reason to fail the run."""
+    is_shared = shared_file_matcher(shared_files)
+    msps = msp_items(items, shared_files)
     msp_of, msp_files = {}, defaultdict(set)
     by_name = {it["name"]: it for it in items}
-    for group in msp_items(items):
+    for group in msps:
         for n in group:
             msp_of[n] = group[0]
     for it in items:
@@ -902,7 +1031,16 @@ def reconcile(items, clusters, actual_files):
         for f in sorted(set(changed) - predicted):
             collided = sorted(m for m, fs in msp_files.items()
                               if m != mine and f in fs)
-            if collided:
+            if collided and is_shared(f):
+                findings.append({
+                    "item": name, "file": f, "severity": "shared-file",
+                    "msp": mine, "also_in_msps": collided,
+                    "integration_order": _named_order(items, msps, [mine] + collided),
+                    "detail": "expected overlap on a declared shared file, not a "
+                              "plan error: integrate these MSPs in this order and "
+                              "read the hunks both sides changed in this file",
+                })
+            elif collided:
                 clean = False
                 findings.append({
                     "item": name, "file": f, "severity": "collision",
@@ -916,9 +1054,21 @@ def reconcile(items, clusters, actual_files):
                     "msp": mine,
                     "detail": "unpredicted, but inside this item's own MSP",
                 })
-    return {"clean": clean, "findings": findings,
-            "collisions": sum(1 for f in findings
-                              if f["severity"] == "collision")}
+    out = {"clean": clean, "findings": findings,
+           "collisions": sum(1 for f in findings
+                             if f["severity"] == "collision")}
+    overlaps = sum(1 for f in findings if f["severity"] == "shared-file")
+    if overlaps:  # absent unless a declared shared file was actually crossed
+        out["shared_overlaps"] = overlaps
+    return out
+
+
+def _named_order(items, msps, names):
+    """MSPs given by name (the first leaf, as reconcile names them) put in
+    integration order."""
+    index = {g[0]: i for i, g in enumerate(msps)}
+    rank = msp_rank(items, msps)
+    return sorted(set(names), key=lambda n: rank[index[n]])
 
 
 # ── runner (optional: EXECUTE the plan instead of only printing it) ─────────
@@ -1662,7 +1812,8 @@ def run_plan(plan_obj, items, exec_template, concurrency=4, dry_run=False,
             if name in by_name and isinstance(changed, list):
                 actual[name] = changed
     if actual:
-        result["reconcile"] = reconcile(items, clusters, actual)
+        result["reconcile"] = reconcile(items, clusters, actual,
+                                        plan_obj.get("shared_files"))
     if run_dir:
         result["run_dir"] = run_dir
     return result
@@ -1691,6 +1842,15 @@ def main():
                          '"after"?:["producer-item", ...]}]')
     ap.add_argument("--risk-markers", default="",
                     help="comma-separated path substrings that force the top tier")
+    ap.add_argument("--shared-files", default="",
+                    help="comma-separated files many features edit in DISJOINT "
+                         "regions (type registries, test registries, API docs, a "
+                         "very large screen component). An overlap ONLY on these "
+                         "does not fuse leaves into one MSP, cluster or serialize "
+                         "edge; an overlap on any other file fuses as usual. An "
+                         "entry matches a path that equals it, ends with '/' + "
+                         "entry, or matches it as an fnmatch glob. Never a file "
+                         "whose shared lines carry one contract.")
     ap.add_argument("--trajectories", default=DEFAULT_TRAJECTORY_STORE,
                     help="trajectory-kb JSONL store for history-aware tiering + coupling "
                          "(default: the global store; missing file = ignored)")
@@ -1816,6 +1976,7 @@ def main():
             items = json.load(f)
     markers = [m for m in args.risk_markers.split(",") if m]
     serial_markers = [m for m in args.serial_verify_markers.split(",") if m]
+    shared = [e.strip() for e in args.shared_files.split(",") if e.strip()]
     trajectories = [] if args.no_trajectories else load_trajectories(args.trajectories)
     if args.plan_file:
         with open(args.plan_file, encoding="utf-8") as f:
@@ -1824,7 +1985,8 @@ def main():
         computed = plan(items, args.graph, markers, trajectories,
                         serial_markers, args.context_hops,
                         args.max_context_files, args.coalesce_below,
-                        args.coalesce_max, briefs=not args.no_briefs)
+                        args.coalesce_max, briefs=not args.no_briefs,
+                        shared_files=shared)
     if recon_report is not None:
         computed["recon"] = recon_report
     if not args.exec_template:
@@ -1869,7 +2031,9 @@ def main():
         raise SystemExit(1)
     # nor may a cross-MSP collision: every cluster succeeded, and the PLAN was
     # still wrong - two MSPs were not disjoint and ran in parallel anyway. That
-    # is the failure this tool exists to prevent, so it cannot exit 0.
+    # is the failure this tool exists to prevent, so it cannot exit 0. A touch
+    # of a DECLARED shared file is reported as `shared_overlaps`, not counted
+    # here: those MSPs overlap on purpose and integrate in a stated order.
     if result.get("reconcile", {}).get("collisions"):
         raise SystemExit(1)
 

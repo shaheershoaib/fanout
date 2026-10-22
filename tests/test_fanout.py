@@ -1162,5 +1162,390 @@ class ReconcileRunsAutomatically(unittest.TestCase):
         hit = [f for f in rc["findings"] if f["severity"] == "collision"][0]
         self.assertEqual((hit["item"], hit["file"]), ("one", "b/f.py"))
 
+
+TYPES = "packages/contract/src/types.ts"
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+class SharedFilesPlanning(unittest.TestCase):
+    """`--shared-files`: files many features append to, in disjoint regions. An
+    overlap that is ONLY on those must not fuse two features into one PR - the
+    edits merge with a trivial keep-both - while any other overlap fuses as ever."""
+
+    SHARED = ["types.ts"]
+
+    def two(self, extra_a=(), extra_b=()):
+        return [{"name": "a", "files": ["feat/a.ts", TYPES, *extra_a]},
+                {"name": "b", "files": ["feat/b.ts", TYPES, *extra_b]}]
+
+    def test_overlap_only_on_a_shared_file_does_not_fuse(self):
+        items = self.two()
+        self.assertEqual([sorted(g) for g in fp.msp_items(items)], [["a", "b"]])  # today
+        out = fp.plan(items, None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual(sorted(sorted(g) for g in out["msps"]), [["a"], ["b"]])
+        self.assertEqual(sorted(sorted(c) for c in out["clusters"]), [["a"], ["b"]])
+        self.assertEqual(out["cluster_after"], {})   # no serialize edge either
+        self.assertEqual(len(out["cluster_briefs"]), 2)
+
+    def test_the_pair_is_flagged_for_a_verdict_and_defaults_parallel(self):
+        out = fp.plan(self.two(), None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual(out["coupling_review"], [
+            {"pair": ["a", "b"], "signals": ["shared-file:" + TYPES],
+             "default": "parallel"}])
+
+    def test_one_signal_per_shared_file_they_share(self):
+        extra = ("docs/API.md",)
+        out = fp.plan(self.two(extra, extra), None, [], trajectories=[],
+                      shared_files=["types.ts", "API.md"])
+        self.assertEqual(out["coupling_review"][0]["signals"],
+                         ["shared-file:docs/API.md", "shared-file:" + TYPES])
+
+    def test_another_signal_that_says_serialize_still_wins(self):
+        items = [{"name": "a", "files": ["app/billing/a.py", TYPES]},
+                 {"name": "b", "files": ["app/billing/b.py", TYPES]}]
+        out = fp.plan(items, None, ["billing"], trajectories=[],
+                      shared_files=self.SHARED)
+        (entry,) = out["coupling_review"]
+        self.assertEqual(entry["signals"],
+                         ["shared-risk-marker:billing", "shared-file:" + TYPES])
+        self.assertEqual(entry["default"], "serialize")
+
+    def test_overlap_on_a_non_shared_file_still_fuses(self):
+        items = self.two(("lib/x.ts",), ("lib/x.ts",))
+        out = fp.plan(items, None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual([sorted(g) for g in out["msps"]], [["a", "b"]])
+        self.assertEqual([sorted(c) for c in out["clusters"]], [["a", "b"]])
+        self.assertEqual(out["coupling_review"], [])   # co-clustered: no verdict due
+
+    def test_a_shared_file_does_not_unfuse_a_pair_another_file_fuses(self):
+        """Three leaves: a-b share a real file, b-c only a shared one."""
+        items = [{"name": "a", "files": ["lib/x.ts"]},
+                 {"name": "b", "files": ["lib/x.ts", TYPES]},
+                 {"name": "c", "files": [TYPES]}]
+        out = fp.plan(items, None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual(sorted(sorted(g) for g in out["msps"]), [["a", "b"], ["c"]])
+
+    def test_contract_group_and_after_are_unchanged(self):
+        items = [{"name": "svc", "files": ["s.py", TYPES], "contract_group": "g"},
+                 {"name": "view", "files": ["v.py"], "contract_group": "g"},
+                 {"name": "late", "files": ["l.py", TYPES], "after": ["svc"]}]
+        out = fp.plan(items, None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual(sorted(sorted(g) for g in out["msps"]),
+                         [["late"], ["svc", "view"]])
+        self.assertEqual(sorted(sorted(c) for c in out["clusters"]),
+                         [["late"], ["svc", "view"]])
+        cid = {n: i for i, c in enumerate(out["clusters"]) for n in c}
+        self.assertEqual(out["cluster_after"], {cid["late"]: [cid["svc"]]})
+
+    def test_leaves_of_one_msp_still_share_one_cluster_on_a_shared_file(self):
+        """A declared `msp` puts leaves in ONE worktree. Two agents editing one
+        file in one tree at once is a race no merge will ever reconcile, so the
+        relaxation applies BETWEEN MSPs only."""
+        items = [{"name": "a", "files": ["a.ts", TYPES], "msp": "feature"},
+                 {"name": "b", "files": ["b.ts", TYPES], "msp": "feature"}]
+        out = fp.plan(items, None, [], trajectories=[], shared_files=self.SHARED)
+        self.assertEqual([sorted(g) for g in out["msps"]], [["a", "b"]])
+        self.assertEqual([sorted(c) for c in out["clusters"]], [["a", "b"]])
+
+    def test_entries_match_by_equality_suffix_or_glob(self):
+        m = fp.shared_file_matcher(["API.md", "lib/api/memory.ts", "docs/*.md",
+                                    "packages/*/src/types.ts"])
+        self.assertTrue(m("API.md"))                       # equal
+        self.assertTrue(m("apps/web/API.md"))              # ends with "/" + entry
+        self.assertTrue(m("apps/web/lib/api/memory.ts"))   # multi-segment suffix
+        self.assertTrue(m("docs/guide.md"))                # glob
+        self.assertTrue(m("packages/contract/src/types.ts"))   # glob, mid-path star
+        self.assertFalse(m("MY_API.md"))                   # not on a "/" boundary
+        self.assertFalse(m("lib/api/memory.tsx"))
+        self.assertFalse(m("other/guide.md"))
+        self.assertFalse(m("packages/contract/src/other.ts"))
+
+    def test_a_path_with_glob_characters_matches_literally(self):
+        """Next.js route segments are `[claimId]` and `(internal)`; the glob
+        reading of those must not stop the literal path matching itself."""
+        route = "app/(internal)/crm/[claimId]/ClaimDetailView.tsx"
+        m = fp.shared_file_matcher([route])
+        self.assertTrue(m(route))
+        self.assertTrue(m("apps/web/" + route))
+
+    def test_no_entries_means_nothing_is_shared(self):
+        for empty in (None, [], ["", "  "]):
+            self.assertFalse(fp.shared_file_matcher(empty)("anything.ts"))
+
+    def test_a_planned_run_echoes_the_entries_and_a_plain_one_does_not(self):
+        on = fp.plan(self.two(), None, [], trajectories=[], shared_files=[" types.ts "])
+        self.assertEqual(on["shared_files"], ["types.ts"])
+        off = fp.plan(self.two(), None, [], trajectories=[])
+        self.assertNotIn("shared_files", off)
+        self.assertNotIn("integration_order", off)
+
+
+class IntegrationOrder(unittest.TestCase):
+    """Parallel build, serial integration: for every shared file two or more MSPs
+    edit, the order to merge them in. Each entry is an MSP index into `msps`."""
+
+    API = "docs/API.md"
+
+    def order(self, items, shared=("types.ts", "API.md"), **kw):
+        out = fp.plan(items, None, [], trajectories=[], shared_files=list(shared), **kw)
+        named = {f: ["+".join(sorted(out["msps"][i])) for i in idx]
+                 for f, idx in out.get("integration_order", {}).items()}
+        return out, named
+
+    def test_each_shared_file_two_msps_edit_gets_an_ordered_list(self):
+        items = [{"name": "a", "files": ["a.ts", TYPES, self.API], "cost": 3},
+                 {"name": "b", "files": ["b.ts", TYPES]},
+                 {"name": "c", "files": ["c.ts", self.API]},
+                 {"name": "d", "files": ["d.ts", "docs/only-d.md"]}]
+        out, named = self.order(items, shared=("types.ts", "API.md", "only-d.md"))
+        self.assertEqual(named, {self.API: ["a", "c"], TYPES: ["a", "b"]})
+        self.assertEqual(list(out["integration_order"]), sorted(out["integration_order"]))
+        self.assertTrue(all(isinstance(i, int)
+                            for v in out["integration_order"].values() for i in v))
+
+    def test_a_shared_file_only_one_msp_edits_is_not_listed(self):
+        items = [{"name": "a", "files": ["a.ts", TYPES]}, {"name": "b", "files": ["b.ts"]}]
+        out, named = self.order(items)
+        self.assertNotIn("integration_order", out)
+
+    def test_two_leaves_of_one_msp_count_once(self):
+        items = [{"name": "a1", "files": ["a1.ts", TYPES], "msp": "A"},
+                 {"name": "a2", "files": ["a2.ts", "a1.ts"], "msp": "A"},
+                 {"name": "b", "files": ["b.ts", TYPES]}]
+        out, named = self.order(items)
+        self.assertEqual(sorted(named[TYPES]), ["a1+a2", "b"])
+
+    def test_dependency_order_comes_first(self):
+        """The consumer is listed FIRST and is the bigger leaf, so both input
+        order and size say consumer-first; the `after` edge says otherwise."""
+        items = [{"name": "consumer", "files": ["c.ts", TYPES], "cost": 9,
+                  "after": ["producer"]},
+                 {"name": "producer", "files": ["p.ts", TYPES], "cost": 1}]
+        out, named = self.order(items)
+        self.assertEqual(named[TYPES], ["producer", "consumer"])
+
+    def test_dependency_order_is_per_msp_not_per_leaf(self):
+        """MSP A holds a big free leaf AND a leaf that waits on B, so A's own
+        priority beats B's - yet A cannot integrate before the MSP it waits on."""
+        items = [{"name": "a1", "files": ["a1.ts", TYPES], "cost": 100, "msp": "A"},
+                 {"name": "a2", "files": ["a2.ts"], "msp": "A", "after": ["b1"]},
+                 {"name": "b1", "files": ["b1.ts", TYPES], "cost": 1}]
+        out, named = self.order(items)
+        self.assertEqual(named[TYPES], ["b1", "a1+a2"])
+
+    def test_then_the_critical_path_orders_independent_msps(self):
+        items = [{"name": "short", "files": ["s.ts", TYPES], "cost": 1},
+                 {"name": "long", "files": ["l.ts", TYPES], "cost": 5},
+                 {"name": "chain-head", "files": ["h.ts", TYPES], "cost": 1},
+                 {"name": "chain-tail", "files": ["t.ts"], "cost": 8,
+                  "after": ["chain-head"]}]
+        _, named = self.order(items)
+        self.assertEqual(named[TYPES], ["chain-head", "long", "short"])
+
+    def test_ties_fall_back_to_input_order_and_the_plan_is_repeatable(self):
+        items = [{"name": n, "files": [n + ".ts", TYPES]} for n in "xyz"]
+        out, named = self.order(items, shared=("types.ts",))
+        self.assertEqual(named[TYPES], ["x", "y", "z"])
+        again = fp.plan(items, None, [], trajectories=[], shared_files=["types.ts"])
+        self.assertEqual(again["integration_order"], out["integration_order"])
+        self.assertEqual(again["plan_id"], out["plan_id"])
+
+    def test_a_cycle_between_msps_is_ordered_not_fatal(self):
+        """Item-level `after` is acyclic, but each MSP can hold a producer of the
+        other. That is a plan worth warning about, not one worth crashing on."""
+        items = [{"name": "a1", "files": ["a1.ts", TYPES], "msp": "A", "after": ["b1"]},
+                 {"name": "a2", "files": ["a2.ts"], "msp": "A"},
+                 {"name": "b1", "files": ["b1.ts", TYPES], "msp": "B"},
+                 {"name": "b2", "files": ["b2.ts"], "msp": "B", "after": ["a2"]}]
+        _, named = self.order(items)
+        self.assertEqual(sorted(named[TYPES]), ["a1+a2", "b1+b2"])
+
+    def test_a_glob_entry_lists_every_concrete_file_it_matched(self):
+        items = [{"name": "a", "files": ["docs/one.md", "docs/two.md"]},
+                 {"name": "b", "files": ["docs/one.md"]},
+                 {"name": "c", "files": ["docs/two.md"]}]
+        _, named = self.order(items, shared=("docs/*.md",))
+        self.assertEqual(named, {"docs/one.md": ["a", "b"], "docs/two.md": ["a", "c"]})
+
+    def test_overlap_on_a_real_file_still_fuses_into_one_entry(self):
+        items = [{"name": "a", "files": ["lib/x.ts", TYPES]},
+                 {"name": "b", "files": ["lib/x.ts", TYPES]},
+                 {"name": "c", "files": ["c.ts", TYPES]}]
+        _, named = self.order(items)
+        self.assertEqual(named[TYPES], ["a+b", "c"])
+
+    def test_without_the_flag_there_is_no_order(self):
+        items = [{"name": "a", "files": [TYPES]}, {"name": "b", "files": [TYPES]}]
+        self.assertNotIn("integration_order", fp.plan(items, None, [], trajectories=[]))
+
+
+class SharedFilesExec(unittest.TestCase):
+    """`--exec` fails a run whose MSPs collide on a file recon did not predict.
+    On a DECLARED shared file that overlap is expected: it is reported with the
+    order to integrate in, and the run does not fail."""
+
+    ITEMS = [{"name": "one", "files": ["a/f.py"], "task": "t"},
+             {"name": "two", "files": ["b/f.py"], "task": "t"},
+             {"name": "three", "files": ["c/f.py"], "task": "t"},
+             {"name": "four", "files": ["d/f.py"], "task": "t"}]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def worker(self, extra):
+        """A fake worker that reports its own files plus `extra[cluster]`."""
+        path = os.path.join(self.tmp, "w.py")
+        with open(path, "w") as f:
+            f.write("import os, json\n"
+                    "extra = %r\n"
+                    "c = os.environ['FANOUT_CLUSTER']\n"
+                    "mine = [f for f in os.environ.get('FANOUT_FILES','').split(',') if f]\n"
+                    "print(json.dumps({'item': c, 'status': 'ok',"
+                    " 'files_changed': mine + extra.get(c, []), 'notes': 'd'}))\n" % extra)
+        return "%s %s" % (sys.executable, path)
+
+    def run_it(self, extra, shared=None, items=None):
+        items = items or self.ITEMS
+        pl = fp.plan(items, None, [], trajectories=[], shared_files=shared)
+        return fp.run_plan(pl, items, self.worker(extra), branches=False,
+                           push_remote=None, run_dir=os.path.join(self.tmp, "rd"))
+
+    def cli(self, extra, *flags, items=None):
+        items_path = os.path.join(self.tmp, "items.json")
+        with open(items_path, "w") as f:
+            json.dump(items or self.ITEMS, f)
+        return subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(fp.__file__), "fanout.py"),
+             "--items", items_path, "--no-trajectories", "--no-branches",
+             "--exec", self.worker(extra), "--run-dir", os.path.join(self.tmp, "rd")]
+            + list(flags), capture_output=True, text=True)
+
+    def test_without_the_flag_a_cross_msp_touch_is_a_collision(self):
+        rc = self.run_it({"one": ["b/f.py"]})["reconcile"]
+        self.assertFalse(rc["clean"])
+        self.assertEqual(rc["collisions"], 1)
+        self.assertNotIn("shared_overlaps", rc)
+
+    def test_a_collision_only_on_a_shared_file_is_an_expected_overlap(self):
+        res = self.run_it({"one": ["b/f.py"]}, shared=["b/f.py"])
+        rc = res["reconcile"]
+        self.assertTrue(rc["clean"])
+        self.assertEqual(rc["collisions"], 0)
+        self.assertEqual(rc["shared_overlaps"], 1)
+        (hit,) = rc["findings"]
+        self.assertEqual((hit["item"], hit["file"], hit["severity"]),
+                         ("one", "b/f.py", "shared-file"))
+        self.assertEqual(hit["integration_order"], ["one", "two"])
+        self.assertEqual(res["summary"], {"ok": 4})
+
+    def test_the_overlap_carries_the_plans_integration_order(self):
+        """The MSP that touched the file without predicting it is ordered
+        against the one that did, by the same rule the plan uses: the producer
+        integrates first even though the consumer is listed first."""
+        items = [{"name": "consumer", "files": ["b/f.py"], "task": "t",
+                  "after": ["producer"]},
+                 {"name": "producer", "files": ["a/f.py"], "task": "t"}]
+        rc = self.run_it({"producer": ["b/f.py"]}, shared=["b/f.py"],
+                         items=items)["reconcile"]
+        (hit,) = rc["findings"]
+        self.assertEqual((hit["msp"], hit["also_in_msps"]), ("producer", ["consumer"]))
+        self.assertEqual(hit["integration_order"], ["producer", "consumer"])
+
+    def test_a_collision_on_any_other_file_still_fails_beside_a_shared_one(self):
+        rc = self.run_it({"one": ["b/f.py"], "three": ["d/f.py"]},
+                         shared=["b/f.py"])["reconcile"]
+        self.assertFalse(rc["clean"])
+        self.assertEqual(rc["collisions"], 1)
+        self.assertEqual(rc["shared_overlaps"], 1)
+        sev = {f["file"]: f["severity"] for f in rc["findings"]}
+        self.assertEqual(sev, {"b/f.py": "shared-file", "d/f.py": "collision"})
+
+    def test_an_unpredicted_shared_file_nobody_else_edits_is_still_noise(self):
+        rc = self.run_it({"one": ["a/new.py"]}, shared=["a/new.py"])["reconcile"]
+        self.assertEqual([f["severity"] for f in rc["findings"]], ["noise"])
+        self.assertNotIn("shared_overlaps", rc)
+
+    def test_a_saved_plan_remembers_its_shared_files(self):
+        """--plan-file executes a plan computed earlier, possibly by someone who
+        no longer has the flag to hand."""
+        pl = fp.plan(self.ITEMS, None, [], trajectories=[], shared_files=["b/f.py"])
+        saved = json.loads(json.dumps(pl))
+        res = fp.run_plan(saved, self.ITEMS, self.worker({"one": ["b/f.py"]}),
+                          branches=False, push_remote=None,
+                          run_dir=os.path.join(self.tmp, "rd"))
+        self.assertEqual(res["reconcile"]["collisions"], 0)
+        self.assertEqual(res["reconcile"]["shared_overlaps"], 1)
+
+    def test_cli_exits_zero_on_a_shared_overlap_and_one_on_any_other(self):
+        touch_shared = {"one": ["b/f.py"]}
+        self.assertEqual(self.cli(touch_shared).returncode, 1)               # today
+        ok = self.cli(touch_shared, "--shared-files", "f.py,b/f.py")
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        out = json.loads(ok.stdout)
+        self.assertEqual(out["reconcile"]["shared_overlaps"], 1)
+        self.assertEqual(out["reconcile"]["findings"][0]["integration_order"],
+                         ["one", "two"])
+        bad = self.cli({"one": ["b/f.py"], "three": ["d/f.py"]},
+                       "--shared-files", "b/f.py")
+        self.assertEqual(bad.returncode, 1)
+        self.assertEqual(json.loads(bad.stdout)["reconcile"]["collisions"], 1)
+
+    def test_a_dry_run_has_nothing_to_reconcile_and_does_not_fail(self):
+        pl = fp.plan(self.ITEMS, None, [], trajectories=[], shared_files=["b/f.py"])
+        res = fp.run_plan(pl, self.ITEMS, "true {prompt}", dry_run=True)
+        self.assertEqual(res["summary"]["dry-run"], 4)
+        self.assertNotIn("reconcile", res)
+
+
+class NoSharedFilesIsUnchanged(unittest.TestCase):
+    """Without the flag the plan is what it was before the feature existed. The
+    golden file was produced by the pre-feature planner (origin/main at 8de9992)."""
+
+    def setUp(self):
+        with open(os.path.join(FIXTURES, "plan_without_shared_files.json"),
+                  encoding="utf-8") as f:
+            self.golden = json.load(f)
+        self.tmp = tempfile.mkdtemp()
+        self.graph = os.path.join(self.tmp, "graph.json")
+        with open(self.graph, "w", encoding="utf-8") as f:
+            json.dump(self.golden["graph"], f)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def plan(self, **kw):
+        return fp.plan(self.golden["items"], self.graph,
+                       self.golden["risk_markers"], trajectories=[], **kw)
+
+    def test_plan_is_byte_identical_to_the_pre_feature_plan(self):
+        want = json.dumps(self.golden["plan"], indent=2)
+        self.assertEqual(json.dumps(self.plan(), indent=2), want)
+        self.assertEqual(json.dumps(self.plan(shared_files=None), indent=2), want)
+        self.assertEqual(json.dumps(self.plan(shared_files=[]), indent=2), want)
+
+    def test_cli_output_is_byte_identical_to_the_pre_feature_plan(self):
+        items = os.path.join(self.tmp, "items.json")
+        with open(items, "w", encoding="utf-8") as f:
+            json.dump(self.golden["items"], f)
+        proc = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(fp.__file__), "fanout.py"),
+             "--items", items, "--graph", self.graph, "--no-trajectories",
+             "--risk-markers", ",".join(self.golden["risk_markers"])],
+            capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, json.dumps(self.golden["plan"], indent=2) + "\n")
+
+    def test_a_flag_that_matches_nothing_changes_only_its_own_echo(self):
+        got = json.loads(json.dumps(self.plan(shared_files=["no-such-file.ts"])))
+        self.assertEqual(got.pop("shared_files"), ["no-such-file.ts"])
+        self.assertNotEqual(got.pop("plan_id"), self.golden["plan"]["plan_id"])
+        want = dict(self.golden["plan"])
+        want.pop("plan_id")
+        self.assertEqual(got, want)
+
+
 if __name__ == "__main__":
     unittest.main()
